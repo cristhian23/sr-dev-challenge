@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/TestResults/
+node_modules/
+.env
+.env.*
+!.env.example
+.vs/
+*.user
+*.suo
