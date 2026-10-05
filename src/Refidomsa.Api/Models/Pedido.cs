@@ -6,15 +6,25 @@ namespace Refidomsa.Api.Models;
 
 public class Pedido
 {
-    public Guid Id { get; }
-    public Guid DistribuidorId { get; }
-    public DateTimeOffset FechaEntrega { get; }
-    public DateTimeOffset FechaCreacion { get; }
+    private readonly List<LineaPedido> _lineas = new List<LineaPedido>();
+
+    public Guid Id { get; private set; }
+    public Guid DistribuidorId { get; private set; }
+    public DateTimeOffset FechaEntrega { get; private set; }
+    public DateTimeOffset FechaCreacion { get; private set; }
     public DateTimeOffset FechaCambioEstado { get; private set; }
-    public IReadOnlyList<LineaPedido> Lineas { get; }
-    public decimal Total { get; }
+    public IReadOnlyList<LineaPedido> Lineas
+    {
+        get { return _lineas.AsReadOnly(); }
+    }
+    public decimal Total { get; private set; }
     public EstadoPedido Estado { get; private set; }
     public string? MotivoRechazo { get; private set; }
+
+    // EF reconstruye datos persistidos; la creacion de negocio sigue pasando por Crear.
+    private Pedido()
+    {
+    }
 
     private Pedido(Guid distribuidorId, DateTimeOffset fechaEntrega,
         DateTimeOffset fechaCreacion, LineaPedido[] lineas)
@@ -25,7 +35,7 @@ public class Pedido
         FechaCreacion = fechaCreacion.ToUniversalTime();
         FechaCambioEstado = FechaCreacion;
         Estado = EstadoPedido.Pendiente;
-        Lineas = Array.AsReadOnly(lineas);
+        _lineas.AddRange(lineas);
         Total = lineas.Sum(linea => linea.Subtotal);
     }
 

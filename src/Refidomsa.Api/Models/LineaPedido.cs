@@ -2,11 +2,16 @@ namespace Refidomsa.Api.Models;
 
 public class LineaPedido
 {
-    public Guid ProductoId { get; }
-    public string NombreProducto { get; }
-    public decimal Galones { get; }
-    public decimal PrecioPorGalon { get; }
-    public decimal Subtotal { get; }
+    public Guid ProductoId { get; private set; }
+    public string NombreProducto { get; private set; }
+    public decimal Galones { get; private set; }
+    public decimal PrecioPorGalon { get; private set; }
+    public decimal Subtotal { get; private set; }
+
+    private LineaPedido()
+    {
+        NombreProducto = string.Empty;
+    }
 
     public LineaPedido(Guid productoId, string nombreProducto, decimal galones, decimal precioPorGalon)
     {

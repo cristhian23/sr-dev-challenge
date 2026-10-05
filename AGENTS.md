@@ -30,6 +30,10 @@ Un solo proyecto de aplicacion, src/Refidomsa.Api, organizado por responsabilida
 
 Crear solo archivos/carpetas necesarios para funcionalidades reales. No agregar repositorios genericos, UnitOfWork propio, CQRS, MediatR ni proyectos de capas adicionales sin necesidad concreta.
 
+Persistencia existente: EF Core con setters/constructores privados y coleccion de lineas por backing field. Conservar encapsulamiento al agregar consultas. Las migraciones parciales y snapshots generados conservan las convenciones de nombres del tooling EF; no son clases manuales. Versiones de dependencias y herramienta EF fijadas.
+
+Usar scripts/local.ps1 para inicializacion local explicita; no migrar/insertar usuarios de demostracion en cada arranque de API. .env se ignora y no debe agregarse a Git. La cuenta sa y TrustServerCertificate son exclusivamente para desarrollo loopback.
+
 ## Reglas y seguridad
 
 - Separar formato de entrada HTTP de reglas del negocio; una sola fuente de cada regla.
