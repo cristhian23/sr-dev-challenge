@@ -2,9 +2,9 @@
 
 ## Estado actual
 
-Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 159 pruebas unitarias, diagnostico de persistencia y QA aislado SQL/HTTP reproducible para productos y credito.
+Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 173 pruebas unitarias, diagnostico de persistencia y QA aislado SQL/HTTP reproducible para productos, credito y creacion transaccional de pedidos.
 
-Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito; el operador puede consultar cualquiera. Todavia NO hay endpoints de pedidos ni frontend. No es una entrega completa del reto.
+Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito y crea pedidos propios; el operador consulta credito de cualquiera, pero no crea. Todavia NO hay GETs de pedidos, cambios de estado HTTP ni frontend. No es una entrega completa del reto.
 
 ## Requisitos locales
 
@@ -83,9 +83,10 @@ dotnet build Refidomsa.slnx --configuration Release
 dotnet test Refidomsa.slnx --configuration Release --no-build
 .\scripts\local.ps1 -Accion Verificar
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 2
 ```
 
-Las 159 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT, identidad, saldo negativo y traduccion de errores de negocio. Una prueba comprueba que credito ajeno retorna antes de cualquier consulta. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
+Las 173 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT, identidad, saldo negativo y traduccion de errores de negocio. Comprueban que credito ajeno retorna antes de consultar y que Operador no abre la transaccion de creacion. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
 
 Verificar es un diagnostico de integracion local, separado de las unitarias. Comprueba semilla, hashes, guardado/lectura de un pedido con dos lineas, cantidades decimales, fechas, total, precio historico tras cambiar el catalogo y cambio de estado. Revierte su transaccion y comprueba que no quedan pedido ni precio alterado. No expone un endpoint y solo se admite en Development.
 
@@ -102,9 +103,19 @@ El README exige operaciones, no URLs exactas; estos son los contratos minimos ad
 - Credito consumido: suma SQL de Pendiente/Aprobado del propietario, agregado vacio = 0. Disponible utiliza la formula pura `ReglasCredito.CalcularDisponible(limite, consumido)`; no carga pedidos ni lineas y no oculta saldo negativo. Esta lectura informativa NO reserva credito ni protege creaciones concurrentes.
 - JWT ausente, malformado o firma alterada: 401 ProblemDetails y `WWW-Authenticate: Bearer`. Errores de negocio: middleware central con `codigo`, 400 para reglas, 403 sin_permiso, 409 credito_insuficiente/transicion_invalida. Fallos tecnicos siguen hacia UseExceptionHandler con 500 generico; no se convierten en 400. En este bloque no hay una accion HTTP que produzca 403/409: su traduccion esta probada unitariamente.
 
-`qa-pedidos.ps1 -Bloque 1` requiere SQL healthy existente y puertos QA 5081/5082/5173 libres. Crea exclusivamente `Refidomsa_QA_<GuidN>`, inicializa/migra con el comando Development existente y arranca dos APIs Release propias. Password/clave temporales solo en entornos hijos; no usa el password semilla de produccion ni imprime secretos. Finalmente cierra procesos propios, elimina solo su DB y compara digests en memoria de Refidomsa (incluye hashes, catalogo, pedidos, lineas e historial EF) y .env. No modifica Compose, volumen ni variables del padre. Actualmente acepta solo bloque 1; los siguientes bloques ampliaran el harness.
+`qa-pedidos.ps1 -Bloque 1|2` requiere SQL healthy existente y puertos QA 5081/5082/5173 libres. Crea exclusivamente `Refidomsa_QA_<GuidN>`, inicializa/migra con el comando Development existente y arranca dos APIs Release propias. Password/clave temporales solo en entornos hijos; no usa el password semilla de produccion ni imprime secretos. Finalmente cierra procesos propios, elimina solo su DB y compara digests en memoria de Refidomsa (incluye hashes, catalogo, pedidos, lineas e historial EF) y .env. No modifica Compose, volumen ni variables del padre. No ejecutar dos harnesses simultaneamente: comparten puertos QA, aunque sus bases sean distintas.
 
 Ejecucion real 2026-10-06: diagnosticos C# sin errores, Release 0 errores/advertencias, 159 unitarias aprobadas sin fallos/omisiones y harness exit0. HTTP: cuatro productos para los tres usuarios, credito propio/operador, consumo mixto exacto 290100 y saldo -90099.75, agregado vacio, 404 ajeno/inexistente, 401 ausente/invalido/firma alterada, 400 IDs invalidos/vacios y segunda API. Limpieza QA y digests originales identicos confirmados.
+
+## Crear pedidos (bloque 2)
+
+`POST /api/pedidos` requiere Bearer de Distribuidor y recibe solo `{fechaEntrega,lineas:[{productoId,galones}]}`. Devuelve 201 con Location `/api/pedidos/{id}` y detalle: id, distribuidorId, nombreDistribuidor, fechaEntrega, fechaCreacion, fechaCambioEstado, total, estado literal, motivoRechazo y lineas con productoId/nombreProducto/galones/precioPorGalon/subtotal. Location identifica el recurso; GET detalle se implementara en bloque 3.
+
+El flujo es DTO de formato -> controller/identidad autenticada -> PedidosService -> transaccion ReadCommitted -> primera lectura parametrizada de la fila Distribuidores por PK con UPDLOCK/HOLDLOCK -> catalogo sin tracking -> SUM Pendiente/Aprobado -> hora UTC actual -> Pedido.Crear/Rules -> SaveChangesAsync -> commit -> DTO. El bloqueo por distribuidor se conserva hasta commit/rollback y funciona entre instancias distintas, incluso sin pedidos previos. La hora se obtiene despues de esperar; no se carga una entidad tracked obsoleta. Fallos y cancelacion revierten la transaccion, usando un token no cancelado para la limpieza. Futuras mutaciones deben seguir el mismo protocolo.
+
+Formato invalido/precision mayor de seis decimales/extremos: 400; reglas de lineas/producto/fecha: 400 con codigo; credito insuficiente: 409 credito_insuficiente; Operador: 403 sin_permiso antes del caso de uso. Campos extra de distribuidor, rol, credito, precios, subtotales, total y creacion se ignoran y nunca son autoridad. Las restricciones de negocio siguen solamente en Rules; DTOs comprueban presencia, identificadores y representacion decimal(18,6).
+
+Evidencia directa 2026-10-06: Release sin errores/advertencias, 173 pruebas aprobadas, diagnosticos C# sin errores y QA acumulativo SQL/HTTP con 201/Location/detalle, snapshots, galones fraccionarios, 400 sin escrituras, 401/403 y limites exactos de credito/409. Veinte carreras sincronizadas mediante lock SQL externo (10 sin pedidos previos, 10 con consumo previo), dos APIs, dieron exactamente un201/un409 y conteos/importes SQL exactos. Sur completo mientras Norte seguia bloqueado. Refidomsa/.env identicos y DB/procesos QA propios eliminados. Las verificaciones ampliadas de cancelacion y reloj tras bloqueo estan incluidas en el harness; su resultado se registra tras la ejecucion final.
 
 ## Persistencia y migraciones
 
@@ -147,9 +158,9 @@ Precios y galones usan decimal(18,6); importes y credito decimal(28,2). Se recha
 ## Pendientes deliberados
 
 1. Autorizacion por recurso de pedidos; credito propio ya protegido.
-2. DTOs, servicios y controllers de pedidos, filtros y paginacion.
-3. Reservar credito transaccionalmente y proteger cambios de estado concurrentes; consulta de credito y traduccion de reglas a HTTP ya implementadas.
+2. Consultas de pedidos, filtros y paginacion.
+3. Cambios de estado HTTP autorizados y concurrentes; creacion transaccional, consulta de credito y traduccion de reglas a HTTP ya implementadas.
 4. Frontend React y Compose de API/frontend (actualmente solo SQL esta contenerizado).
 5. Suite automatizada de integracion/e2e y CI segun tiempo.
 
-La transaccion del diagnostico y la de semilla NO implementan aun la reserva de credito para solicitudes de pedidos. No incluimos registro de usuarios, recuperacion de contrasenas ni IA dentro del producto en el alcance inicial.
+La creacion protege el credito mediante el pedido Pendiente guardado, sin balance mutable ni reserva adicional. No incluimos registro de usuarios, recuperacion de contrasenas ni IA dentro del producto en el alcance inicial.

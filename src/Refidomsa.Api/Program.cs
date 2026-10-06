@@ -50,6 +50,7 @@ public class Program
             builder.Services.AddScoped<AutenticacionService>();
             builder.Services.AddScoped<ProductosService>();
             builder.Services.AddScoped<CreditoService>();
+            builder.Services.AddScoped<PedidosService>();
             builder.Services.AddHttpContextAccessor();
             builder.Services.AddScoped<LectorUsuarioActual>();
             builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)

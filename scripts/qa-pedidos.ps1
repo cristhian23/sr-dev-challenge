@@ -1,10 +1,11 @@
 param(
-    [ValidateSet(1)]
+    [ValidateSet(1, 2)]
     [int]$Bloque = 1
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
+Add-Type -AssemblyName System.Web.Extensions
 $raiz = Split-Path -Parent $PSScriptRoot
 $envFile = Join-Path $raiz '.env'
 $dll = Join-Path $raiz 'src\Refidomsa.Api\bin\Release\net10.0\Refidomsa.Api.dll'
@@ -88,28 +89,37 @@ function Start-ApiProceso([string]$argumentos) {
 }
 
 function Invoke-Http([string]$ruta, [int]$status, [string]$token = '', [object]$cuerpo = $null,
-    [int]$puerto = 5081) {
+    [int]$puerto = 5081, [switch]$RawJson) {
     $metodo = [System.Net.Http.HttpMethod]::Get
     if ($null -ne $cuerpo) { $metodo = [System.Net.Http.HttpMethod]::Post }
     $solicitud = New-Object System.Net.Http.HttpRequestMessage($metodo, "http://127.0.0.1:$puerto$ruta")
     try {
         if ($token) { $solicitud.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $token) }
         if ($null -ne $cuerpo) {
-            $solicitud.Content = New-Object System.Net.Http.StringContent(($cuerpo | ConvertTo-Json -Depth 10),
+            $json = $cuerpo | ConvertTo-Json -Depth 10
+            if ($RawJson) { $json = [string]$cuerpo }
+            $solicitud.Content = New-Object System.Net.Http.StringContent($json,
                 [Text.Encoding]::UTF8, 'application/json')
         }
         $respuesta = $cliente.SendAsync($solicitud).GetAwaiter().GetResult()
         try {
             Assert-QA ([int]$respuesta.StatusCode -eq $status) "$ruta esperaba HTTP $status, recibio $([int]$respuesta.StatusCode)."
             $texto = $respuesta.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ($status -eq 201) {
+                $detalle = $texto | ConvertFrom-Json
+                Assert-QA ($respuesta.Headers.Location.ToString() -eq "/api/pedidos/$($detalle.id)") 'Location de creacion incorrecto.'
+            }
             if ($status -ge 400) {
                 Assert-QA ($respuesta.Content.Headers.ContentType.MediaType -eq 'application/problem+json') 'Error sin ProblemDetails.'
-                $problema = $texto | ConvertFrom-Json
+                # PS5.1 ConvertFrom-Json rechaza la clave vacia de errores de validacion del body.
+                $serializador = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                $problema = $serializador.DeserializeObject($texto)
                 Assert-QA ($problema.status -eq $status -and $problema.title -and $problema.instance -eq $ruta) 'Contrato ProblemDetails incorrecto.'
                 if ($status -ne 400) { Assert-QA ($problema.detail) 'ProblemDetails sin detail.' }
                 if ($status -eq 401) { Assert-QA ($respuesta.Headers.WwwAuthenticate.ToString() -eq 'Bearer') 'Falta WWW-Authenticate Bearer.' }
             }
             Write-Host "PASS HTTP $status $ruta"
+            if ($status -ge 400) { return $problema }
             return ($texto | ConvertFrom-Json)
         } finally { $respuesta.Dispose() }
     } finally { $solicitud.Dispose() }
@@ -135,6 +145,279 @@ function Assert-Credito($respuesta, [string]$id, [decimal]$limite, [decimal]$con
         'creditoConsumido,creditoDisponible,distribuidorId,limiteCredito') 'Credito expone campos fuera del contrato.'
 }
 
+function Get-QARows([string]$sql, [hashtable]$parametros = @{}) {
+    $filas = (Invoke-Sql $qaNombre ($sql + ' FOR JSON PATH, INCLUDE_NULL_VALUES') $parametros -Texto) | ConvertFrom-Json
+    return $filas
+}
+
+function Get-PedidosDigest {
+    $pedidos = Invoke-Sql $qaNombre 'SELECT * FROM Pedidos ORDER BY Id FOR JSON PATH, INCLUDE_NULL_VALUES' -Texto
+    $lineas = Invoke-Sql $qaNombre 'SELECT * FROM LineasPedido ORDER BY PedidoId, ProductoId FOR JSON PATH' -Texto
+    return Get-Digest ([Text.Encoding]::UTF8.GetBytes($pedidos + $lineas))
+}
+
+function Reset-Pedidos([decimal]$limite = 145050) {
+    Invoke-Sql $qaNombre 'DELETE FROM LineasPedido; DELETE FROM Pedidos; UPDATE Distribuidores SET LimiteCredito = @limite' @{ '@limite' = $limite }
+}
+
+function Assert-NoEscritura($cuerpo, [int]$status = 400, [string]$token = $tokens['distribuidor.norte'], [switch]$RawJson) {
+    $antes = Get-PedidosDigest
+    $errorHttp = Invoke-Http '/api/pedidos' $status $token -cuerpo $cuerpo -RawJson:$RawJson
+    Assert-QA ((Get-PedidosDigest) -eq $antes) 'Una solicitud rechazada modifico pedidos/lineas.'
+    if ($status -eq 409) { Assert-QA ($errorHttp.codigo -eq 'credito_insuficiente') 'Conflicto sin codigo de credito.' }
+    if ($status -eq 403) { Assert-QA ($errorHttp.codigo -eq 'sin_permiso') '403 sin codigo de permiso.' }
+}
+
+function Assert-PedidoSQL($detalle) {
+    $filas = @(Get-QARows 'SELECT * FROM Pedidos WHERE Id = @id' @{ '@id' = [Guid]$detalle.id })
+    Assert-QA ($filas.Count -eq 1) 'Pedido creado no encontrado en SQL.'
+    $fila = $filas[0]
+    Assert-QA ($fila.DistribuidorId -eq $detalle.distribuidorId -and $fila.Estado -eq 'Pendiente' -and
+        [decimal]$fila.Total -eq [decimal]$detalle.total -and $null -eq $fila.MotivoRechazo) 'Cabecera SQL incorrecta.'
+    foreach ($campo in @('FechaCreacion', 'FechaEntrega', 'FechaCambioEstado')) {
+        Assert-QA ([DateTimeOffset]$fila.$campo -eq [DateTimeOffset]$detalle.$campo) "Fecha SQL $campo incorrecta."
+        Assert-QA (([DateTimeOffset]$fila.$campo).Offset -eq [TimeSpan]::Zero) 'Fecha persistida no UTC.'
+    }
+    Assert-QA ($detalle.estado -eq 'Pendiente' -and $detalle.fechaCreacion -eq $detalle.fechaCambioEstado -and
+        $null -eq $detalle.motivoRechazo) 'Estado inicial incorrecto.'
+    $distribuidor = @(Get-QARows 'SELECT Nombre FROM Distribuidores WHERE Id = @id' @{ '@id' = [Guid]$detalle.distribuidorId })
+    Assert-QA ($detalle.nombreDistribuidor -eq $distribuidor[0].Nombre) 'Nombre distribuidor incorrecto.'
+    Assert-QA ((@($detalle.PSObject.Properties.Name | Sort-Object) -join ',') -eq
+        'distribuidorId,estado,fechaCambioEstado,fechaCreacion,fechaEntrega,id,lineas,motivoRechazo,nombreDistribuidor,total') 'Detalle fuera de contrato.'
+    $lineasSQL = @(Get-QARows 'SELECT * FROM LineasPedido WHERE PedidoId = @id' @{ '@id' = [Guid]$detalle.id })
+    Assert-QA ($lineasSQL.Count -eq $detalle.lineas.Count) 'Cantidad de lineas SQL incorrecta.'
+    [decimal]$total = 0
+    foreach ($linea in $detalle.lineas) {
+        $guardada = @($lineasSQL | Where-Object { $_.ProductoId -eq $linea.productoId })
+        Assert-QA ($guardada.Count -eq 1) 'Linea no encontrada en SQL.'
+        foreach ($campo in @('NombreProducto', 'Galones', 'PrecioPorGalon', 'Subtotal')) {
+            Assert-QA ($guardada[0].$campo -eq $linea.$campo) "Snapshot SQL $campo difiere de respuesta."
+        }
+        $subtotal = [decimal]::Round(([decimal]$linea.galones * [decimal]$linea.precioPorGalon), 2, [MidpointRounding]::AwayFromZero)
+        Assert-QA ($subtotal -eq [decimal]$linea.subtotal) 'Redondeo de subtotal incorrecto.'
+        $total += $subtotal
+        Assert-QA ((@($linea.PSObject.Properties.Name | Sort-Object) -join ',') -eq
+            'galones,nombreProducto,precioPorGalon,productoId,subtotal') 'Linea fuera de contrato.'
+    }
+    Assert-QA ($total -eq [decimal]$detalle.total) 'Total no suma subtotales.'
+}
+
+function Start-PostPedido([object]$cuerpo, [string]$token, [int]$puerto,
+    [System.Threading.CancellationToken]$cancelacion = [System.Threading.CancellationToken]::None) {
+    $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "http://127.0.0.1:$puerto/api/pedidos")
+    $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $token)
+    $request.Content = New-Object System.Net.Http.StringContent(($cuerpo | ConvertTo-Json -Depth 10), [Text.Encoding]::UTF8, 'application/json')
+    return [PSCustomObject]@{ Request = $request; Task = $cliente.SendAsync($request, $cancelacion) }
+}
+
+function Complete-PostPedido($pendiente) {
+    $respuesta = $pendiente.Task.GetAwaiter().GetResult()
+    try {
+        $detalle = $respuesta.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        $status = [int]$respuesta.StatusCode
+        if ($status -eq 201) {
+            Assert-QA ($respuesta.Headers.Location.ToString() -eq "/api/pedidos/$($detalle.id)") 'Location de carrera incorrecto.'
+            Assert-PedidoSQL $detalle
+        } elseif ($status -eq 409) {
+            Assert-QA ($detalle.codigo -eq 'credito_insuficiente' -and $detalle.status -eq 409 -and
+                $respuesta.Content.Headers.ContentType.MediaType -eq 'application/problem+json') '409 de carrera incorrecto.'
+        } else { throw "Carrera recibio HTTP $status inesperado." }
+        return $status
+    } finally { $respuesta.Dispose() }
+}
+
+function Open-DistribuidorLock([string]$id) {
+    $conexion = New-Object System.Data.SqlClient.SqlConnection($conexionQA)
+    try {
+        $conexion.Open()
+        $transaccion = $conexion.BeginTransaction([System.Data.IsolationLevel]::ReadCommitted)
+        $comando = $conexion.CreateCommand()
+        try {
+            $comando.Transaction = $transaccion
+            $comando.CommandText = 'SELECT Id FROM Distribuidores WITH (UPDLOCK, HOLDLOCK) WHERE Id = @id; SELECT @@SPID;'
+            [void]$comando.Parameters.AddWithValue('@id', [Guid]$id)
+            $lector = $comando.ExecuteReader()
+            try {
+                Assert-QA ($lector.Read()) 'Distribuidor de lock no existe.'
+                [void]$lector.NextResult()
+                Assert-QA ($lector.Read()) 'Falta session ID del lock.'
+                # @@SPID es smallint; GetInt32 lanza InvalidCastException en PS5.1.
+                $spid = $lector.GetInt16(0)
+            } finally { $lector.Dispose() }
+        } finally { $comando.Dispose() }
+        return [PSCustomObject]@{ Conexion = $conexion; Transaccion = $transaccion; Spid = $spid }
+    } catch { $conexion.Dispose(); throw }
+}
+
+function Wait-LockRequests($bloqueo, [int]$cantidad) {
+    $limite = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $limite) {
+        # SQL puede encadenar el segundo waiter detras del primero, no directamente detras del holder.
+        $filas = @(Get-QARows @'
+WITH Esperas AS (
+ SELECT session_id FROM sys.dm_exec_requests WHERE blocking_session_id = @spid AND database_id = DB_ID(@db)
+ UNION ALL
+ SELECT r.session_id FROM sys.dm_exec_requests r JOIN Esperas e ON r.blocking_session_id = e.session_id
+ WHERE r.database_id = DB_ID(@db)
+)
+SELECT COUNT(*) AS cantidad FROM Esperas
+'@ @{ '@spid' = $bloqueo.Spid; '@db' = $qaNombre })
+        if ($filas[0].cantidad -ge $cantidad) { return }
+        Start-Sleep -Milliseconds 40
+    }
+    throw 'No se comprobo que ambas APIs esperan el lock SQL por distribuidor.'
+}
+
+function Invoke-CarreraCredito([bool]$consumoPrevio, [int]$iteracion) {
+    Reset-Pedidos
+    if ($consumoPrevio) {
+        Invoke-Sql $qaNombre 'UPDATE Distribuidores SET LimiteCredito = 290100 WHERE Id = @id' @{ '@id' = [Guid]$norte }
+        $previo = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo $pedidoValido
+        Assert-PedidoSQL $previo
+    }
+    $bloqueo = Open-DistribuidorLock $norte
+    $peticiones = @()
+    try {
+        $peticiones += Start-PostPedido $pedidoValido $tokens['distribuidor.norte'] 5081
+        $peticiones += Start-PostPedido $pedidoValido $tokens['distribuidor.norte'] 5082
+        Wait-LockRequests $bloqueo 2
+        Assert-QA (-not $peticiones[0].Task.IsCompleted -and -not $peticiones[1].Task.IsCompleted) 'Creacion evadio lock SQL.'
+        $bloqueo.Transaccion.Commit()
+        [void][System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]@($peticiones[0].Task, $peticiones[1].Task)).GetAwaiter().GetResult()
+        $status = @($peticiones | ForEach-Object { Complete-PostPedido $_ } | Sort-Object)
+        Assert-QA (($status -join ',') -eq '201,409') 'Carrera no produjo exactamente 201/409.'
+        $resumen = @(Get-QARows 'SELECT COUNT(*) AS cantidad, SUM(Total) AS consumido FROM Pedidos WHERE DistribuidorId = @id' @{ '@id' = [Guid]$norte })
+        $esperados = 1
+        if ($consumoPrevio) { $esperados = 2 }
+        Assert-QA ($resumen[0].cantidad -eq $esperados -and [decimal]$resumen[0].consumido -eq 145050 * $esperados) 'Sobreconsumo o escrituras extra en carrera.'
+        $lineas = @(Get-QARows 'SELECT COUNT(*) AS cantidad FROM LineasPedido')
+        Assert-QA ($lineas[0].cantidad -eq $esperados) 'Lineas extra o faltantes en carrera.'
+        Write-Host "PASS carrera $iteracion consumoPrevio=$consumoPrevio HTTP201/409 y SQL exacto"
+    } finally {
+        $bloqueo.Transaccion.Dispose()
+        $bloqueo.Conexion.Dispose()
+        foreach ($peticion in $peticiones) {
+            if (-not $peticion.Task.IsCompleted) { try { $peticion.Task.GetAwaiter().GetResult().Dispose() } catch { } }
+            $peticion.Request.Dispose()
+        }
+    }
+}
+
+function Test-Bloque2 {
+    Reset-Pedidos 10000000
+    $producto = 'aaaaaaaa-0000-0000-0000-000000000001'
+    $fecha = [DateTimeOffset]::UtcNow.AddDays(3).ToOffset([TimeSpan]::FromHours(-4))
+    while ($fecha.DayOfWeek -eq [DayOfWeek]::Sunday) { $fecha = $fecha.AddDays(1) }
+    $script:pedidoValido = @{ fechaEntrega = $fecha.ToString('o'); lineas = @(@{ productoId = $producto; galones = 500 }) }
+    $antes = [DateTimeOffset]::UtcNow
+    $detalle = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo $pedidoValido
+    Assert-PedidoSQL $detalle
+    Assert-QA ($detalle.distribuidorId -eq $norte -and [decimal]$detalle.total -eq 145050 -and
+        [DateTimeOffset]$detalle.fechaCreacion -ge $antes -and [DateTimeOffset]$detalle.fechaCreacion -le [DateTimeOffset]::UtcNow) 'No se uso identidad/catalogo/reloj servidor.'
+    $snapshot = Get-PedidosDigest
+    Invoke-Sql $qaNombre 'UPDATE Productos SET PrecioPorGalon = 999, Nombre = @nombre WHERE Id = @id' @{ '@id' = [Guid]$producto; '@nombre' = 'QA precio cambiado' }
+    Assert-QA ((Get-PedidosDigest) -eq $snapshot) 'Cambio de catalogo altero snapshot del pedido.'
+    Invoke-Sql $qaNombre 'UPDATE Productos SET PrecioPorGalon = 290.1, Nombre = @nombre WHERE Id = @id' @{ '@id' = [Guid]$producto; '@nombre' = $detalle.lineas[0].nombreProducto }
+    $extra = @{ fechaEntrega = $fecha.ToString('o'); distribuidorId = $sur; total = 1; creditoDisponible = 1;
+        rol = 'Operador'; fechaCreacion = '2000-01-01T00:00:00Z'; lineas = @(@{ productoId = $producto; galones = 500; precioPorGalon = 0.01; subtotal = 1 }) }
+    $conExtra = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo $extra
+    Assert-PedidoSQL $conExtra
+    Assert-QA ($conExtra.distribuidorId -eq $norte -and $conExtra.total -eq 145050 -and [DateTimeOffset]$conExtra.fechaCreacion -ge $antes) 'Campos extra influyen en creacion.'
+    $fraccion = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo @{ fechaEntrega = $fecha.ToString('o'); lineas = @(@{ productoId = $producto; galones = [decimal]500.000123 }) }
+    Assert-PedidoSQL $fraccion
+    Assert-QA ($fraccion.lineas[0].galones -eq [decimal]500.000123 -and $fraccion.total -eq [decimal]145050.04) 'Precision fraccional alterada.'
+    foreach ($cantidad in @([decimal]499, [decimal]9001, [decimal]500.1234567, [decimal]::MaxValue, [decimal]::MinValue)) {
+        Assert-NoEscritura @{ fechaEntrega = $fecha.ToString('o'); lineas = @(@{ productoId = $producto; galones = $cantidad }) }
+    }
+    foreach ($id in @([Guid]::NewGuid().ToString(), [Guid]::Empty.ToString(), 'no-es-guid')) {
+        Assert-NoEscritura @{ fechaEntrega = $fecha.ToString('o'); lineas = @(@{ productoId = $id; galones = 500 }) }
+    }
+    foreach ($lineas in @(@(), @(@{ productoId = $producto; galones = 500 }, @{ productoId = $producto; galones = 500 }),
+        @(@{ productoId = $producto; galones = 500 }, @{ productoId = $producto; galones = 500 }, @{ productoId = $producto; galones = 500 }, @{ productoId = $producto; galones = 500 }, @{ productoId = $producto; galones = 500 }))) {
+        Assert-NoEscritura @{ fechaEntrega = $fecha.ToString('o'); lineas = @($lineas) }
+    }
+    $domingo = $fecha
+    while ($domingo.DayOfWeek -ne [DayOfWeek]::Sunday) { $domingo = $domingo.AddDays(1) }
+    foreach ($entrega in @($domingo.ToString('o'), [DateTimeOffset]::UtcNow.AddHours(23).ToString('o'), 'no-es-fecha')) {
+        Assert-NoEscritura @{ fechaEntrega = $entrega; lineas = @(@{ productoId = $producto; galones = 500 }) }
+    }
+    foreach ($invalido in @(@{}, @{ fechaEntrega = $null; lineas = $null },
+        @{ fechaEntrega = $fecha.ToString('o'); lineas = @($null) },
+        @{ fechaEntrega = $fecha.ToString('o'); lineas = @(@{ productoId = $producto }) })) {
+        Assert-NoEscritura $invalido
+    }
+    foreach ($json in @('null', '{', '{"fechaEntrega":"2026-10-08T12:00:00Z","lineas":[{"productoId":"aaaaaaaa-0000-0000-0000-000000000001","galones":1e100}]}')) {
+        Assert-NoEscritura $json -RawJson
+    }
+    Assert-NoEscritura @{ fechaEntrega = $fecha.ToString('o'); lineas = @(
+        @{ productoId = $producto; galones = 5000 },
+        @{ productoId = 'aaaaaaaa-0000-0000-0000-000000000002'; galones = 5000 }) }
+    Assert-NoEscritura $pedidoValido 403 $tokens['operador']
+    Assert-NoEscritura $pedidoValido 401 ''
+    Assert-NoEscritura $pedidoValido 401 'token-invalido'
+    foreach ($cantidadValida in @(9000, 500)) {
+        $lineasValidas = @(@{ productoId = $producto; galones = $cantidadValida })
+        if ($cantidadValida -eq 500) {
+            $lineasValidas = @($catalogoSQL | ForEach-Object { @{ productoId = $_.id; galones = 500 } })
+        }
+        $limiteValido = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo @{ fechaEntrega = $fecha.ToString('o'); lineas = $lineasValidas }
+        Assert-PedidoSQL $limiteValido
+    }
+    Reset-Pedidos 145050
+    $exacto = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo $pedidoValido
+    Assert-PedidoSQL $exacto
+    Assert-Credito (Invoke-Http "/api/distribuidores/$norte/credito" 200 $tokens['distribuidor.norte']) $norte 145050 145050 0
+    Assert-NoEscritura $pedidoValido 409
+    Reset-Pedidos 145049.99
+    Assert-NoEscritura $pedidoValido 409
+    foreach ($previo in @($false, $true)) {
+        for ($iteracion = 1; $iteracion -le 10; $iteracion++) { Invoke-CarreraCredito $previo $iteracion }
+    }
+    Reset-Pedidos
+    $bloqueo = Open-DistribuidorLock $norte
+    $pendiente = $null
+    try {
+        $pendiente = Start-PostPedido $pedidoValido $tokens['distribuidor.norte'] 5081
+        Wait-LockRequests $bloqueo 1
+        $independiente = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.sur'] -cuerpo $pedidoValido -puerto 5082
+        Assert-PedidoSQL $independiente
+        Assert-QA (-not $pendiente.Task.IsCompleted) 'No se demostro independencia de distribuidores.'
+        $liberacion = [DateTimeOffset]::UtcNow
+        $bloqueo.Transaccion.Commit()
+        $respuestaPendiente = $pendiente.Task.GetAwaiter().GetResult()
+        $detallePendiente = $respuestaPendiente.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        Assert-QA ([DateTimeOffset]$detallePendiente.fechaCreacion -ge $liberacion) 'Hora de creacion obtenida antes de esperar lock.'
+        Assert-QA ((Complete-PostPedido $pendiente) -eq 201) 'Norte no completo tras liberar lock.'
+        Write-Host 'PASS Sur completa mientras Norte espera: bloqueo por distribuidor, no global'
+    } finally {
+        $bloqueo.Transaccion.Dispose(); $bloqueo.Conexion.Dispose()
+        if ($pendiente) { $pendiente.Request.Dispose() }
+    }
+    Reset-Pedidos
+    $bloqueo = Open-DistribuidorLock $norte
+    $cancelacion = New-Object System.Threading.CancellationTokenSource
+    $pendiente = $null
+    try {
+        $pendiente = Start-PostPedido $pedidoValido $tokens['distribuidor.norte'] 5081 $cancelacion.Token
+        Wait-LockRequests $bloqueo 1
+        $cancelacion.Cancel()
+        $cancelado = $false
+        try { [void]$pendiente.Task.GetAwaiter().GetResult() } catch [System.OperationCanceledException] { $cancelado = $true }
+        Assert-QA $cancelado 'Request no cancelo.'
+        Start-Sleep -Milliseconds 250
+        $bloqueo.Transaccion.Commit()
+        # Esperar una nueva creacion verifica que la cancelada libero su transaccion/bloqueo.
+        $despues = Invoke-Http '/api/pedidos' 201 $tokens['distribuidor.norte'] -cuerpo $pedidoValido -puerto 5082
+        Assert-PedidoSQL $despues
+        $filas = @(Get-QARows 'SELECT COUNT(*) AS cantidad FROM Pedidos')
+        Assert-QA ($filas[0].cantidad -eq 1) 'Cancelacion dejo escrituras persistidas.'
+        Write-Host 'PASS cancelacion esperando lock: rollback sin escrituras y bloqueo liberado'
+    } finally {
+        $bloqueo.Transaccion.Dispose(); $bloqueo.Conexion.Dispose(); $cancelacion.Dispose()
+        if ($pendiente) { $pendiente.Request.Dispose() }
+    }
+}
+
 try {
     Assert-QA (Test-Path -LiteralPath $envFile) 'Falta .env existente.'
     Assert-QA (Test-Path -LiteralPath $dll) 'Ejecuta primero el build Release.'
@@ -149,8 +432,10 @@ try {
     $healthy = & docker inspect --format '{{.State.Health.Status}}' refidomsa-sqlserver-1
     Assert-QA ($LASTEXITCODE -eq 0 -and $healthy -eq 'healthy') 'SQL Server debe estar healthy; no se altera Compose.'
     foreach ($puerto in @(5081, 5082, 5173)) {
-        $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $puerto)
-        try { $listener.Start() } finally { $listener.Stop() }
+        # TIME_WAIT de una ejecucion previa no es un listener ocupado.
+        $ocupados = @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
+            Where-Object { $_.Port -eq $puerto })
+        Assert-QA ($ocupados.Count -eq 0) "Puerto QA $puerto ocupado; no se detienen procesos ajenos."
     }
     $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
     $builder['Data Source'] = 'tcp:127.0.0.1,14333'
@@ -233,6 +518,7 @@ SELECT @pedido, Id, Nombre, 500, PrecioPorGalon, 145050.00 FROM Productos WHERE 
     [void](Invoke-Http '/api/distribuidores/no-es-guid/credito' 400 $tokens['operador'])
     [void](Invoke-Http '/api/distribuidores/00000000-0000-0000-0000-000000000000/credito' 400 $tokens['operador'])
     [void](Invoke-Http '/api/productos' 200 $tokens['operador'] -puerto 5082)
+    if ($Bloque -ge 2) { Test-Bloque2 }
     Write-Host "PASS bloque $Bloque SQL/HTTP real"
 } finally {
     $erroresLimpieza = New-Object System.Collections.Generic.List[string]
