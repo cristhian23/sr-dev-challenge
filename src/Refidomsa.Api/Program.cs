@@ -1,8 +1,11 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Refidomsa.Api.Data;
 using Refidomsa.Api.Models;
+using Refidomsa.Api.Security;
+using Refidomsa.Api.Services;
 
 namespace Refidomsa.Api;
 
@@ -26,6 +29,50 @@ public class Program
         builder.Services.AddScoped<VerificadorPersistencia>();
         builder.Services.AddProblemDetails();
         builder.Services.AddHealthChecks().AddCheck<SqlServerHealthCheck>("sqlserver");
+
+        if (!inicializar && !verificar)
+        {
+            var configuracionJwt = new ConfiguracionJwt();
+            builder.Configuration.GetSection(ConfiguracionJwt.Seccion).Bind(configuracionJwt);
+            configuracionJwt.Validar();
+            builder.Services.AddSingleton(configuracionJwt);
+            builder.Services.AddSingleton<GeneradorToken>();
+            builder.Services.AddScoped<AutenticacionService>();
+            builder.Services.AddHttpContextAccessor();
+            builder.Services.AddScoped<LectorUsuarioActual>();
+            builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+                .AddJwtBearer(options =>
+                {
+                    options.MapInboundClaims = false;
+                    options.TokenValidationParameters = configuracionJwt.CrearParametrosValidacion();
+                    options.Events = new JwtBearerEvents
+                    {
+                        OnTokenValidated = context =>
+                        {
+                            if (context.Principal == null
+                                || !LectorUsuarioActual.TryCrear(context.Principal, out _))
+                            {
+                                context.Fail("Identidad no valida.");
+                            }
+                            return Task.CompletedTask;
+                        },
+                        OnChallenge = async context =>
+                        {
+                            context.HandleResponse();
+                            context.Response.Headers.WWWAuthenticate = "Bearer";
+                            await Results.Problem(statusCode: StatusCodes.Status401Unauthorized,
+                                title: "No autorizado",
+                                detail: "Se requiere una identidad valida.").ExecuteAsync(context.HttpContext);
+                        },
+                        OnForbidden = context => Results.Problem(
+                            statusCode: StatusCodes.Status403Forbidden,
+                            title: "Acceso denegado",
+                            detail: "No tienes permiso para acceder a este recurso.").ExecuteAsync(context.HttpContext)
+                    };
+                });
+            builder.Services.AddAuthorization();
+            builder.Services.AddControllers();
+        }
 
         var app = builder.Build();
         if (inicializar || verificar)
@@ -54,6 +101,9 @@ public class Program
         }
 
         app.UseExceptionHandler();
+        app.UseAuthentication();
+        app.UseAuthorization();
+        app.MapControllers();
         app.MapHealthChecks("/health", new HealthCheckOptions { Predicate = _ => false });
         app.MapHealthChecks("/health/ready");
         await app.RunAsync();

@@ -26,6 +26,10 @@ foreach ($linea in Get-Content -LiteralPath $envFile) {
 if (-not $valores['SQLSERVER_PASSWORD'] -or -not $valores['SEED_PASSWORD']) {
     throw '.env debe definir SQLSERVER_PASSWORD y SEED_PASSWORD.'
 }
+if ($Accion -eq 'Ejecutar' -and [string]::IsNullOrEmpty($env:Jwt__Clave) -and
+    [string]::IsNullOrWhiteSpace($valores['JWT_KEY'])) {
+    throw 'Define Jwt__Clave en el entorno o JWT_KEY en .env para Ejecutar.'
+}
 
 & docker compose --project-directory $raiz up -d --wait --wait-timeout 240 sqlserver
 if ($LASTEXITCODE -ne 0) { throw 'SQL Server no pudo iniciarse. Revisa Docker Desktop y docker compose logs.' }
@@ -33,6 +37,11 @@ if ($LASTEXITCODE -ne 0) { throw 'SQL Server no pudo iniciarse. Revisa Docker De
 $conexionAnterior = $env:ConnectionStrings__Refidomsa
 $passwordAnterior = $env:DatabaseSeed__Password
 $entornoAnterior = $env:ASPNETCORE_ENVIRONMENT
+if ($Accion -eq 'Ejecutar') {
+    $claveJwtAnterior = $env:Jwt__Clave
+    $emisorJwtAnterior = $env:Jwt__Emisor
+    $audienciaJwtAnterior = $env:Jwt__Audiencia
+}
 try {
     # El builder escapa contrasenas con caracteres especiales en la cadena de conexion.
     $conexion = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
@@ -52,6 +61,9 @@ try {
     } elseif ($Accion -eq 'Verificar') {
         & dotnet run --project $proyecto -- --verify-db
     } else {
+        if ([string]::IsNullOrEmpty($env:Jwt__Clave)) { $env:Jwt__Clave = $valores['JWT_KEY'] }
+        if ([string]::IsNullOrEmpty($env:Jwt__Emisor)) { $env:Jwt__Emisor = 'Refidomsa.Api' }
+        if ([string]::IsNullOrEmpty($env:Jwt__Audiencia)) { $env:Jwt__Audiencia = 'Refidomsa.Client' }
         & dotnet run --project $proyecto -- --urls http://localhost:5080
     }
     if ($LASTEXITCODE -ne 0) { throw "La accion $Accion fallo." }
@@ -59,4 +71,9 @@ try {
     $env:ConnectionStrings__Refidomsa = $conexionAnterior
     $env:DatabaseSeed__Password = $passwordAnterior
     $env:ASPNETCORE_ENVIRONMENT = $entornoAnterior
+    if ($Accion -eq 'Ejecutar') {
+        $env:Jwt__Clave = $claveJwtAnterior
+        $env:Jwt__Emisor = $emisorJwtAnterior
+        $env:Jwt__Audiencia = $audienciaJwtAnterior
+    }
 }

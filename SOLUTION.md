@@ -2,9 +2,9 @@
 
 ## Estado actual
 
-Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial y datos semilla. Hay 66 pruebas unitarias y un diagnostico reproducible contra la base real.
+Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 144 pruebas unitarias, un diagnostico reproducible contra la base real y QA de login por HTTP.
 
-Todavia NO hay login, tokens, endpoints de pedidos, servicios de casos de uso ni frontend. Los usuarios existen en la base, pero aun no pueden iniciar sesion por HTTP. No es una entrega completa del reto.
+Los tres usuarios semilla pueden iniciar sesion y recibir un JWT. Todavia NO hay endpoints de pedidos/productos/credito, autorizacion por recurso ni frontend. No es una entrega completa del reto.
 
 ## Requisitos locales
 
@@ -21,7 +21,7 @@ Desde la raiz del repositorio, en una copia nueva:
 Copy-Item .env.example .env
 ```
 
-Revisa los valores de .env. Son credenciales desechables de prueba, no secretos de produccion. .env esta excluido de Git; el script admite entradas KEY=valor sin comillas. Cambia SQLSERVER_PASSWORD y SEED_PASSWORD si lo deseas ANTES de inicializar por primera vez.
+Revisa los valores de .env. Son credenciales desechables de prueba, no secretos de produccion. .env esta excluido de Git; el script admite entradas KEY=valor sin comillas. Cambia SQLSERVER_PASSWORD y SEED_PASSWORD si lo deseas ANTES de inicializar por primera vez. JWT_KEY en .env.example es una clave publica de demostracion, nunca debe reutilizarse en produccion.
 
 ```powershell
 .\scripts\local.ps1 -Accion Inicializar
@@ -30,9 +30,23 @@ Revisa los valores de .env. Son credenciales desechables de prueba, no secretos 
 
 Inicializar levanta SQL Server, espera a que responda, aplica migraciones e inserta los datos semilla que faltan. Puede repetirse sin duplicarlos ni sobrescribir precios o hashes existentes. Ejecutar levanta/verifica SQL Server y arranca la API en http://localhost:5080; no aplica migraciones implicitamente. En este equipo ya se inicializo la base.
 
+La .env existente de este equipo NO se actualizo y no contiene JWT_KEY. No la reemplaces: agrega manualmente JWT_KEY con al menos 32 bytes UTF-8, o usa una variable temporal. Ejemplo publico solo para desarrollo, no es la clave usada en QA:
+
+```powershell
+$claveAnterior = $env:Jwt__Clave
+try {
+    $env:Jwt__Clave = 'Refidomsa_JWT_PUBLICA_SOLO_DESARROLLO_2026!'
+    .\scripts\local.ps1 -Accion Ejecutar
+} finally {
+    $env:Jwt__Clave = $claveAnterior
+}
+```
+
 Si la politica local impide ejecutar scripts, puedes usar `powershell -ExecutionPolicy Bypass -File .\scripts\local.ps1 -Accion Inicializar` para esa ejecucion; no es necesario cambiar la politica global.
 
-El script configura temporalmente ConnectionStrings__Refidomsa, DatabaseSeed__Password y ASPNETCORE_ENVIRONMENT=Development, y restaura los valores previos al terminar. Tambien puedes configurar esas variables directamente y ejecutar dotnet run. La API no lee .env por si sola: .env es utilizado por Compose y el script.
+El script configura temporalmente ConnectionStrings__Refidomsa, DatabaseSeed__Password y ASPNETCORE_ENVIRONMENT=Development, y restaura los valores previos en finally. Solo Ejecutar necesita JWT: conserva Jwt__Clave, Jwt__Emisor y Jwt__Audiencia preexistentes; si faltan, toma JWT_KEY de .env y usa Refidomsa.Api/Refidomsa.Client. Tambien restaura esas variables al terminar. Inicializar/Verificar no requieren JWT y conservan sus comandos DB.
+
+Para ejecutar dotnet run directamente, configura la conexion y Jwt__Clave, Jwt__Emisor=Refidomsa.Api y Jwt__Audiencia=Refidomsa.Client en el entorno. La API no lee .env por si sola: .env es utilizado por Compose y el script. El arranque HTTP rechaza clave ausente/corta o emisor/audiencia blancos antes de abrir el puerto.
 
 - `/health`: vida del proceso; no consulta SQL.
 - `/health/ready`: conectividad a la base SQL; 200 si conecta, 503 si no. No sustituye la comprobacion de migraciones.
@@ -49,6 +63,19 @@ Con .env.example la contrasena de prueba para los tres es `PruebaRefidomsa_2026!
 
 Los RNC, distribuidores y precios son ficticios. Los productos son Gasolina Premium, Gasolina Regular, Gasoil Optimo (con acento en la base) y Gasoil Regular. No representan precios oficiales actuales.
 
+## Contrato de autenticacion
+
+`POST /api/auth/login` es anonimo y recibe JSON con solo `nombreUsuario` y `password`, ambos obligatorios y no blancos. El nombre se normaliza con Trim/ToLowerInvariant; el password se verifica exactamente como llega, sin recortarlo ni cambiarlo. Rol y distribuidor provienen de SQL, no del cliente.
+
+- 200: `token`, `expiraEnUtc` y `usuario` con `id`, `nombre`, `nombreUsuario`, `rol` y `distribuidorId` (null para Operador). Nunca incluye password/hash.
+- 401 ProblemDetails: respuesta generica identica para usuario desconocido o password incorrecto. El texto del contrato indica credenciales invalidas, sin distinguir la causa.
+- 400 ValidationProblemDetails: campos ausentes/blancos/nulos, cuerpo nulo o JSON malformado.
+- `Cache-Control: no-store` en respuestas de login, incluidos los errores de entrada y credenciales comprobados.
+
+JWT firmado con HS256, no cifrado: su contenido es legible. Vigencia fija de 60 minutos, tolerancia de reloj de 30 segundos, emisor Refidomsa.Api y audiencia Refidomsa.Client. Incluye `sub` (ID del usuario), `name`, `role`, `distribuidorId` solo para Distribuidor, y `iss`/`aud`/`iat`/`nbf`/`exp`. No contiene password/hash ni credito. Las futuras solicitudes protegidas usaran `Authorization: Bearer <token>`; no hay todavia recursos protegidos.
+
+HTTP loopback y la clave publica son solo para desarrollo. Produccion necesita HTTPS, una clave de firma fuerte y protegida y acceso SQL de minimo privilegio. No hay revocacion anticipada, refresh tokens, registro, recuperacion, logout servidor ni /me.
+
 ## Pruebas y comprobacion real
 
 ```powershell
@@ -57,13 +84,13 @@ dotnet test Refidomsa.slnx --configuration Release --no-build
 .\scripts\local.ps1 -Accion Verificar
 ```
 
-Las 66 pruebas no necesitan una base de datos ni un servidor HTTP. Las pruebas de mapeo inspeccionan metadatos EF y las de precision rechazan valores antes de intentar conectarse.
+Las 144 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT e identidad. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
 
 Verificar es un diagnostico de integracion local, separado de las unitarias. Comprueba semilla, hashes, guardado/lectura de un pedido con dos lineas, cantidades decimales, fechas, total, precio historico tras cambiar el catalogo y cambio de estado. Revierte su transaccion y comprueba que no quedan pedido ni precio alterado. No expone un endpoint y solo se admite en Development.
 
-Resultados comprobados: compilacion sin errores/advertencias, 66 pruebas aprobadas, inicializacion repetida sin duplicados, diagnostico real aprobado tambien despues de reiniciar el contenedor, health checks 200 y readiness 503 con conexion no disponible. Conteo final: 3 distribuidores, 4 productos, 3 usuarios, 0 pedidos residuales.
+Resultados actuales del 2026-10-06: build Release repetido sin errores/advertencias y 144 pruebas aprobadas, 0 fallos/omisiones. QA SQL/HTTP aprobado: Verificar sin JWT; login 200 de los tres usuarios y nombre con espacios/mayusculas; password con espacios no recortado; 401 genericos iguales; entradas invalidas 400; no-store y health checks anonimos 200. Clave ausente/corta y emisor/audiencia blancos causaron salida no cero sin listener. Datos, hashes, precios e historial EF quedaron sin cambios, con conteos 3/4/3/0. La API de QA se detuvo y SQL quedo saludable; .env y variables de proceso se conservaron. Evidencia: `.sisyphus/evidence/task-4-qa-20261006-182014.txt`.
 
-La revision independiente por subagentes sigue limitada por la configuracion de modelos descrita en docs/USO_DE_IA.md; no se presenta como aprobada. No se han ejecutado pruebas de login o frontend, pues aun no existen.
+La validacion criptografica se comprobo en unitarias; el QA HTTP decodifico claims, no verifico firmas. No se probo challenge del middleware ni 403/autorizacion por recurso en vivo, pues no existe un recurso protegido. Inicializar tambien se ejecuto sin JWT y termino correctamente en este bloque. Los resultados anteriores de reinicio SQL y readiness 503 son historicos. Las cinco revisiones finales independientes devolvieron PASS (cumplimiento, calidad, seguridad, QA ejecutado y contexto/documentacion); resumen en `.sisyphus/evidence/revision-autenticacion.md`. Esto no certifica produccion ni sustituye el okay y la comprension del candidato. Frontend no implementado ni probado.
 
 ## Persistencia y migraciones
 
@@ -92,7 +119,8 @@ No ejecutar `docker compose down -v` salvo que quieras eliminar deliberadamente 
 - Models y Models/Enums: datos y comportamiento protegido.
 - Rules: condiciones puras, sin HTTP ni SQL.
 - Data/AppDbContext, Configurations, Migrations y DatosSemilla: persistencia.
-- Security/UsuarioActual: contexto de identidad; autenticacion pendiente.
+- Controllers/AutenticacionController, DTOs/Autenticacion y Services/AutenticacionService: contrato HTTP y login sobre SQL/hashes existentes.
+- Security/ConfiguracionJwt, GeneradorToken y LectorUsuarioActual: configuracion, firma/validacion e identidad autenticada para UsuarioActual.
 - Exceptions: errores de negocio con codigo estable.
 - tests/Refidomsa.UnitTests: pruebas sin DB.
 - scripts/local.ps1 y compose.yaml: entorno local.
@@ -102,7 +130,7 @@ Precios y galones usan decimal(18,6); importes y credito decimal(28,2). Se recha
 
 ## Pendientes deliberados
 
-1. Login/JWT, identidad autenticada y autorizacion por recurso.
+1. Autorizacion por recurso al implementar los endpoints de negocio; login/JWT e identidad ya implementados.
 2. DTOs, servicios y controllers de pedidos, filtros y paginacion.
 3. Consultar y reservar credito transaccionalmente, proteger cambios de estado concurrentes y mapear errores a HTTP.
 4. Frontend React y Compose de API/frontend (actualmente solo SQL esta contenerizado).
