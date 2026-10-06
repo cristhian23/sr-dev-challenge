@@ -23,7 +23,7 @@ public class ErroresMiddleware
             int status = exception.Codigo switch
             {
                 "sin_permiso" => StatusCodes.Status403Forbidden,
-                "credito_insuficiente" or "transicion_invalida" => StatusCodes.Status409Conflict,
+                "credito_insuficiente" or "transicion_invalida" or "conflicto_concurrencia" => StatusCodes.Status409Conflict,
                 _ => StatusCodes.Status400BadRequest
             };
             var problema = new ProblemDetails

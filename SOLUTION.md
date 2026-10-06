@@ -4,9 +4,9 @@ Verificacion final independiente del bloque 2 (2026-10-06): Release 0 advertenci
 
 ## Estado actual
 
-Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 219 pruebas unitarias, diagnostico de persistencia y QA aislado SQL/HTTP reproducible para productos, credito, creacion transaccional y consultas autorizadas de pedidos.
+Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 242 pruebas unitarias, diagnostico de persistencia y QA aislado SQL/HTTP reproducible para productos, credito, creacion transaccional, consultas y cambios de estado autorizados de pedidos.
 
-Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito y crea y consulta pedidos propios; el operador consulta credito y pedidos de cualquiera, pero no crea. Todavia NO hay cambios de estado HTTP ni frontend. No es una entrega completa del reto.
+Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito, crea y consulta pedidos propios y cancela solo propios Pendiente; el operador consulta credito y pedidos de cualquiera, aprueba/rechaza Pendiente y despacha Aprobado, pero no crea ni cancela. Todavia NO hay frontend. No es una entrega completa del reto.
 
 ## Requisitos locales
 
@@ -87,9 +87,10 @@ dotnet test Refidomsa.slnx --configuration Release --no-build
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 2
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 3
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 4
 ```
 
-Las 219 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT, identidad, saldo negativo, traduccion de errores de negocio y formato de filtros/paginacion. Comprueban que credito/filtro de pedidos ajeno retorna antes de consultar y que Operador no abre la transaccion de creacion. GalonesJsonConverter comprueba el token numerico antes de convertir a decimal para rechazar precision que CLR podria redondear; admite exponentes y ceros finales sin perdida. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
+Las 242 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT, identidad, saldo negativo, traduccion de errores de negocio, formato de filtros/paginacion, solicitud de cambio de estado y metadata de su token de concurrencia. Comprueban que credito/filtro de pedidos ajeno retorna antes de consultar y que Operador no abre la transaccion de creacion. GalonesJsonConverter comprueba el token numerico antes de convertir a decimal para rechazar precision que CLR podria redondear; admite exponentes y ceros finales sin perdida. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
 
 Verificar es un diagnostico de integracion local, separado de las unitarias. Comprueba semilla, hashes, guardado/lectura de un pedido con dos lineas, cantidades decimales, fechas, total, precio historico tras cambiar el catalogo y cambio de estado. Revierte su transaccion y comprueba que no quedan pedido ni precio alterado. No expone un endpoint y solo se admite en Development.
 
@@ -106,7 +107,7 @@ El README exige operaciones, no URLs exactas; estos son los contratos minimos ad
 - Credito consumido: suma SQL de Pendiente/Aprobado del propietario, agregado vacio = 0. Disponible utiliza la formula pura `ReglasCredito.CalcularDisponible(limite, consumido)`; no carga pedidos ni lineas y no oculta saldo negativo. Esta lectura informativa NO reserva credito ni protege creaciones concurrentes.
 - JWT ausente, malformado o firma alterada: 401 ProblemDetails y `WWW-Authenticate: Bearer`. Errores de negocio: middleware central con `codigo`, 400 para reglas, 403 sin_permiso, 409 credito_insuficiente/transicion_invalida. Fallos tecnicos siguen hacia UseExceptionHandler con 500 generico; no se convierten en 400. En este bloque no hay una accion HTTP que produzca 403/409: su traduccion esta probada unitariamente.
 
-`qa-pedidos.ps1 -Bloque 1|2|3` requiere SQL healthy existente y puertos QA 5081/5082/5173 libres. Crea exclusivamente `Refidomsa_QA_<GuidN>`, inicializa/migra con el comando Development existente y arranca dos APIs Release propias. Password/clave temporales solo en entornos hijos; no usa el password semilla de produccion ni imprime secretos. Finalmente cierra procesos propios, elimina solo su DB y compara digests en memoria de Refidomsa (incluye hashes, catalogo, pedidos, lineas e historial EF) y .env. No modifica Compose, volumen ni variables del padre. No ejecutar dos harnesses simultaneamente: comparten puertos QA, aunque sus bases sean distintas.
+`qa-pedidos.ps1 -Bloque 1|2|3|4` requiere SQL healthy existente y puertos QA 5081/5082/5173 libres. Crea exclusivamente `Refidomsa_QA_<GuidN>`, inicializa/migra con el comando Development existente y arranca dos APIs Release propias. Password/clave temporales solo en entornos hijos; no usa el password semilla de produccion ni imprime secretos. Finalmente cierra procesos propios, elimina solo su DB y compara digests en memoria de Refidomsa (incluye hashes, catalogo, pedidos, lineas e historial EF) y .env. No modifica Compose, volumen ni variables del padre. No ejecutar dos harnesses simultaneamente: comparten puertos QA, aunque sus bases sean distintas.
 
 Ejecucion real 2026-10-06: diagnosticos C# sin errores, Release 0 errores/advertencias, 159 unitarias aprobadas sin fallos/omisiones y harness exit0. HTTP: cuatro productos para los tres usuarios, credito propio/operador, consumo mixto exacto 290100 y saldo -90099.75, agregado vacio, 404 ajeno/inexistente, 401 ausente/invalido/firma alterada, 400 IDs invalidos/vacios y segunda API. Limpieza QA y digests originales identicos confirmados.
 
@@ -129,6 +130,20 @@ Verificacion directa 2026-10-06: diagnosticos de los seis archivos C# nuevos/mod
 - Rango sobre FechaCreacion: desde inclusivo, hasta exclusivo, ISO 8601 con offset explicito (`Z` o `+/-HH:mm`); limites iguales/invertidos producen 400. Codificar `+` como `%2B` en query strings. Estado desconocido/numerico, identificador invalido/vacio y paginacion invalida producen 400 ValidationProblemDetails.
 - Scope de identidad antes de filtros, Count, Skip y Take. Distribuidor solo propio; filtro de otro ID devuelve el mismo 404 que un filtro inaccesible/inexistente. Operador permite cualquier ID, incluso inexistente (200 lista vacia).
 - `GET /api/pedidos/{id}`: detalle con snapshots owned y nombre del distribuidor; ajeno e inexistente devuelven el mismo 404, Guid invalido/vacio 400. Ambas consultas exigen JWT y usan proyecciones sin tracking y cancelacion, sin exponer entidades, usuarios ni hashes.
+
+## Cambiar estado (bloque 4)
+
+`PATCH /api/pedidos/{id}/estado` exige Bearer y recibe `{nuevoEstado,motivo?}`; devuelve 200 con detalle actualizado. NuevoEstado es un nombre exacto del enum (no numero, string numerico, combinacion ni nombre desconocido). Cuerpo vacio/nulo/malformado, ID invalido/vacio y formato invalido producen 400. Motivo solo es obligatorio y no puede estar en blanco para Rechazado. Cualquier motivo suministrado admite hasta 1000 caracteres, tambien para otros destinos; el modelo recorta espacios al guardar el rechazo e ignora el motivo para otros destinos.
+
+Distribuidor solo cancela propios Pendiente. Operador solo aprueba/rechaza Pendiente y despacha Aprobado. Un recurso ajeno/inexistente produce el mismo404 antes de evaluar la accion; accion de rol prohibida sobre pedido visible produce403 sin_permiso; transicion invalida409 transicion_invalida. La validacion de formato HTTP precede al caso de uso. Ningun campo de entidad se asigna fuera de Pedido.CambiarEstado.
+
+Flujo: resolver propietario visible sin tracking -> transaccion ReadCommitted -> bloquear primero Distribuidores por PK con el mismo UPDLOCK/HOLDLOCK del POST -> cargar pedido fresco tracked con lineas owned -> revalidar scope/permiso/transicion -> CambiarEstado con reloj UTC posterior al lock -> SaveChanges -> commit -> detalle. Aprobado sigue consumiendo; Rechazado/Cancelado/Despachado liberan credito solo al commit. Fallos/cancelacion revierten con CancellationToken.None. Estado es token EF aplicativo sobre su columna existente: el UPDATE compara el estado original; DbUpdateConcurrencyException revierte y se traduce a409 conflicto_concurrencia sin retry. Dos mutaciones que respetan el bloqueo se serializan y la segunda transicion incompatible produce409 transicion_invalida. No se promete proteccion frente a SQL arbitrario que ignore el protocolo/token.
+
+Verificacion directa 2026-10-06: Release0warnings/errors,242unitarias0fail/skip, diagnosticos C# sin errores y `dotnet ef migrations has-pending-model-changes --project src/Refidomsa.Api -- --verify-db` sin cambios pendientes; no se agrego migracion ni se edito Inicial. QA acumulativo bloque4 exit0: matriz150 combinaciones (3 identidades x2 propietarios x5 origenes x5 destinos),400/401/403/404/409 sin escrituras, fechas/motivo/snapshots/credito SQL;40 carreras de estados (10 por aprobar/aprobar, aprobar/rechazar, cancelar/aprobar, despachar/despachar) exactamente un200/un409;20 carreras crear/cancelar o crear/despachar con limite para un pedido y resultados seriales sin sobreconsumo. Los20 races de creacion previos y bloques1-3 tambien pasaron; PATCH Sur independiente y cancelacion Norte mientras espera bloqueo, sin escrituras y lock liberado.
+
+El harness ejecuta `scripts/QaConcurrencia.cs` como aplicacion de archivo .NET10 con referencia al proyecto API, sin proyecto/capa/paquete nuevo y AOT desactivado porque EF construye el modelo dinamicamente. Solo acepta catalogo QA con GUID. Dos AppDbContext leen el mismo Pendiente; el primero aprueba y el segundo intento de rechazo lanza DbUpdateConcurrencyException real contra SQL, preservando ganador/fecha/motivo/total. Dos primeros intentos completos fallaron solo en ese auxiliar por el default AOT del SDK; se corrigio y se repitio acumulativo con PASS. En todos los intentos cleanup y digests de Refidomsa/.env fueron identicos. Esto no sustituye revision independiente del parent ni aprobacion humana.
+
+Review-work bloque4: cinco areas finales PASS. Cumplimiento/calidad/seguridad/contexto mediante inspeccion; QA independiente ejecuto Release0warnings/errors,242tests y harness acumulativoexit0. Seguridad encontro propagacion de errores tecnicos SQL sin saneamiento en el harness: catch global ahora informa fallo fijo sin excepcion original ni logs hijos; prueba negativa de puerto ocupado exitnozero y mensaje fijoPASS, re-review seguridadPASS y nueva ejecucion directa completa bloque4exit0. LSP C# individual sin errores; LSP .ps1 no disponible, parser5.1 y ejecucion realPASS. La prueba de dos contextos ejecuta el token EF, y las unitarias traducen su codigo HTTP; el catch de concurrencia del servicio fue verificado por inspeccion, no forzado mediante HTTP.
 
 ## Persistencia y migraciones
 
@@ -159,7 +174,7 @@ No ejecutar `docker compose down -v` salvo que quieras eliminar deliberadamente 
 - Data/AppDbContext, Configurations, Migrations y DatosSemilla: persistencia.
 - Controllers/AutenticacionController, DTOs/Autenticacion y Services/AutenticacionService: contrato HTTP y login sobre SQL/hashes existentes.
 - Controllers/ProductosController y DistribuidoresController, DTOs/Productos y Credito, Services/ProductosService y CreditoService: consultas protegidas proyectadas sin tracking.
-- Controllers/PedidosController, DTOs/Pedidos y Services/PedidosService: POST autorizado, formato/precision exacta JSON, creacion transaccional con snapshots y GETs de lista paginada/detalle con scope por identidad.
+- Controllers/PedidosController, DTOs/Pedidos y Services/PedidosService: POST autorizado, formato/precision exacta JSON, creacion transaccional con snapshots, GETs de lista paginada/detalle con scope por identidad y PATCH de estados con bloqueo/token de concurrencia.
 - Middlewares/ErroresMiddleware: traduccion exclusiva de excepciones de negocio; UseExceptionHandler conserva los fallos inesperados.
 - Security/ConfiguracionJwt, GeneradorToken y LectorUsuarioActual: configuracion, firma/validacion e identidad autenticada para UsuarioActual.
 - Exceptions: errores de negocio con codigo estable.
@@ -171,8 +186,7 @@ Precios y galones usan decimal(18,6); importes y credito decimal(28,2). Se recha
 
 ## Pendientes deliberados
 
-1. Cambios de estado HTTP autorizados y concurrentes; creacion transaccional y consultas autorizadas ya implementadas.
-2. Frontend React y Compose de API/frontend (actualmente solo SQL esta contenerizado).
-3. Suite de navegador/e2e y CI segun tiempo; SQL/HTTP backend ya dispone de harness aislado acumulativo.
+1. Frontend React y Compose de API/frontend (actualmente solo SQL esta contenerizado).
+2. Suite de navegador/e2e y CI segun tiempo; SQL/HTTP backend ya dispone de harness aislado acumulativo.
 
 La creacion protege el credito mediante el pedido Pendiente guardado, sin balance mutable ni reserva adicional. No incluimos registro de usuarios, recuperacion de contrasenas ni IA dentro del producto en el alcance inicial.

@@ -11,7 +11,7 @@ public class PedidoConfiguration : IEntityTypeConfiguration<Pedido>
         builder.ToTable("Pedidos");
         builder.HasKey(pedido => pedido.Id);
         builder.Property(pedido => pedido.Id).ValueGeneratedNever();
-        builder.Property(pedido => pedido.Estado).HasConversion<string>().HasMaxLength(20);
+        builder.Property(pedido => pedido.Estado).HasConversion<string>().HasMaxLength(20).IsConcurrencyToken();
         builder.Property(pedido => pedido.Total).HasPrecision(28, 2);
         builder.Property(pedido => pedido.MotivoRechazo).HasMaxLength(1000);
         builder.HasOne<Distribuidor>().WithMany().HasForeignKey(pedido => pedido.DistribuidorId)

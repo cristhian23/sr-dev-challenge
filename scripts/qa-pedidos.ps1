@@ -1,5 +1,5 @@
 param(
-    [ValidateSet(1, 2, 3)]
+    [ValidateSet(1, 2, 3, 4)]
     [int]$Bloque = 1
 )
 
@@ -60,10 +60,14 @@ function Get-ProduccionDigest {
     return Get-Digest ([Text.Encoding]::UTF8.GetBytes($texto.ToString()))
 }
 
-function Start-ApiProceso([string]$argumentos) {
+function Start-ApiProceso([string]$argumentos, [switch]$PruebaConcurrencia) {
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = 'dotnet'
     $info.Arguments = '"' + $dll + '" ' + $argumentos
+    if ($PruebaConcurrencia) {
+        $info.Arguments = 'run --file "' + (Join-Path $PSScriptRoot 'QaConcurrencia.cs') + '" --configuration Release'
+        $info.EnvironmentVariables['QA_PEDIDO_ID'] = $argumentos
+    }
     $info.WorkingDirectory = $raiz
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -89,9 +93,10 @@ function Start-ApiProceso([string]$argumentos) {
 }
 
 function Invoke-Http([string]$ruta, [int]$status, [string]$token = '', [object]$cuerpo = $null,
-    [int]$puerto = 5081, [switch]$RawJson) {
+    [int]$puerto = 5081, [switch]$RawJson, [switch]$Patch) {
     $metodo = [System.Net.Http.HttpMethod]::Get
     if ($null -ne $cuerpo) { $metodo = [System.Net.Http.HttpMethod]::Post }
+    if ($Patch) { $metodo = New-Object System.Net.Http.HttpMethod('PATCH') }
     $solicitud = New-Object System.Net.Http.HttpRequestMessage($metodo, "http://127.0.0.1:$puerto$ruta")
     try {
         if ($token) { $solicitud.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $token) }
@@ -450,6 +455,257 @@ SELECT @id, Id, Nombre, 500, PrecioPorGalon, 145050 FROM Productos WHERE Id = @p
     Write-Host 'PASS bloque3 scope antes de paginar, filtros/rangos, snapshots y contratos SQL/HTTP'
 }
 
+function New-PedidoEstado([string]$estado = 'Pendiente', [string]$propietario = $norte) {
+    $id = [Guid]::NewGuid()
+    Invoke-Sql $qaNombre @'
+INSERT INTO Pedidos (Id, DistribuidorId, FechaEntrega, FechaCreacion, FechaCambioEstado, Total, Estado, MotivoRechazo)
+VALUES (@id, @owner, '2026-09-08T12:00:00Z', '2026-09-01T12:00:00Z', '2026-09-01T13:00:00Z',
+ 145050, @estado, CASE WHEN @estado = 'Rechazado' THEN 'QA historico' ELSE NULL END);
+INSERT INTO LineasPedido (PedidoId, ProductoId, NombreProducto, Galones, PrecioPorGalon, Subtotal)
+SELECT @id, Id, Nombre, 500, 290.1, 145050 FROM Productos WHERE Id = @producto;
+'@ @{ '@id' = $id; '@owner' = [Guid]$propietario; '@estado' = $estado;
+        '@producto' = [Guid]'aaaaaaaa-0000-0000-0000-000000000001' }
+    return $id.ToString()
+}
+
+function Assert-EstadoSQL($detalle, [string]$esperado, [string]$motivo, $anterior, [DateTimeOffset]$inicio) {
+    $fila = @(Get-QARows 'SELECT * FROM Pedidos WHERE Id = @id' @{ '@id' = [Guid]$detalle.id })[0]
+    Assert-QA ($detalle.estado -eq $esperado -and $fila.Estado -eq $esperado -and
+        $detalle.motivoRechazo -eq $fila.MotivoRechazo) 'Estado/motivo HTTP difiere de SQL.'
+    if ($esperado -eq 'Rechazado') {
+        Assert-QA ($fila.MotivoRechazo -eq $motivo.Trim()) 'Motivo rechazo no corresponde al ganador.'
+    } else { Assert-QA ($null -eq $fila.MotivoRechazo) 'Motivo persistido fuera de rechazo.' }
+    $fecha = [DateTimeOffset]$fila.FechaCambioEstado
+    Assert-QA ($fecha -eq [DateTimeOffset]$detalle.fechaCambioEstado -and $fecha -ge $inicio -and
+        $fecha -le [DateTimeOffset]::UtcNow -and $fecha.Offset -eq [TimeSpan]::Zero) 'Fecha cambio no usa reloj UTC fresco.'
+    foreach ($campo in @('id', 'distribuidorId', 'nombreDistribuidor', 'total', 'fechaEntrega', 'fechaCreacion')) {
+        Assert-QA ($detalle.$campo -eq $anterior.$campo) "PATCH modifico campo inmutable $campo."
+    }
+    Assert-QA (($detalle.lineas | ConvertTo-Json -Depth 10 -Compress) -eq
+        ($anterior.lineas | ConvertTo-Json -Depth 10 -Compress)) 'PATCH modifico snapshots owned.'
+    $lineas = @(Get-QARows 'SELECT ProductoId, NombreProducto, Galones, PrecioPorGalon, Subtotal FROM LineasPedido WHERE PedidoId = @id' @{ '@id' = [Guid]$detalle.id })
+    Assert-QA ($lineas.Count -eq $detalle.lineas.Count) 'PATCH modifico cantidad lineas SQL.'
+    foreach ($campo in @('productoId', 'nombreProducto', 'galones', 'precioPorGalon', 'subtotal')) {
+        Assert-QA ($lineas[0].$campo -eq $detalle.lineas[0].$campo) 'PATCH altero snapshot SQL.'
+    }
+}
+
+function Assert-CreditoSQL([string]$propietario = $norte) {
+    $sql = @(Get-QARows @'
+SELECT d.LimiteCredito, COALESCE(SUM(p.Total), 0) AS Consumido FROM Distribuidores d
+LEFT JOIN Pedidos p ON p.DistribuidorId = d.Id AND p.Estado IN ('Pendiente', 'Aprobado')
+WHERE d.Id = @id GROUP BY d.LimiteCredito
+'@ @{ '@id' = [Guid]$propietario })[0]
+    Assert-QA ([decimal]$sql.Consumido -le [decimal]$sql.LimiteCredito) 'Sobreconsumo en SQL.'
+    Assert-Credito (Invoke-Http "/api/distribuidores/$propietario/credito" 200 $tokens['operador']) `
+        $propietario $sql.LimiteCredito $sql.Consumido ($sql.LimiteCredito - $sql.Consumido)
+}
+
+function Assert-PatchFallo([string]$id, $cuerpo, [int]$status, [string]$usuario = 'operador',
+    [string]$codigo = '', [switch]$RawJson) {
+    $digest = Get-PedidosDigest
+    $errorHttp = Invoke-Http "/api/pedidos/$id/estado" $status $tokens[$usuario] -cuerpo $cuerpo -Patch -RawJson:$RawJson
+    Assert-QA ((Get-PedidosDigest) -eq $digest) 'PATCH fallido modifico cabeceras/lineas.'
+    if ($codigo) { Assert-QA ($errorHttp.codigo -eq $codigo) 'Codigo PATCH incorrecto.' }
+    return $errorHttp
+}
+
+function Start-PatchEstado([string]$id, [string]$estado, [string]$usuario, [int]$puerto,
+    [System.Threading.CancellationToken]$cancelacion = [System.Threading.CancellationToken]::None) {
+    $request = New-Object System.Net.Http.HttpRequestMessage((New-Object System.Net.Http.HttpMethod('PATCH')), "http://127.0.0.1:$puerto/api/pedidos/$id/estado")
+    $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $tokens[$usuario])
+    $request.Content = New-Object System.Net.Http.StringContent((@{ nuevoEstado = $estado; motivo = '  QA carrera  ' } | ConvertTo-Json), [Text.Encoding]::UTF8, 'application/json')
+    return [PSCustomObject]@{ Request = $request; Task = $cliente.SendAsync($request, $cancelacion); Estado = $estado }
+}
+
+function Complete-PatchEstado($pendiente) {
+    $respuesta = $pendiente.Task.GetAwaiter().GetResult()
+    try {
+        $status = [int]$respuesta.StatusCode
+        $body = $respuesta.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        Assert-QA ($status -eq 200 -or $status -eq 409) "Carrera PATCH recibio HTTP $status."
+        if ($status -eq 409) {
+            Assert-QA ($body.codigo -eq 'transicion_invalida' -and $body.status -eq 409 -and
+                $respuesta.Content.Headers.ContentType.MediaType -eq 'application/problem+json') 'Conflicto de carrera PATCH incorrecto.'
+        }
+        return [PSCustomObject]@{ Status = $status; Body = $body; Estado = $pendiente.Estado }
+    } finally { $respuesta.Dispose() }
+}
+
+function Invoke-CarreraEstado([string]$origen, [string]$destino1, [string]$destino2, [int]$iteracion,
+    [switch]$Crear) {
+    Reset-Pedidos 145050
+    $id = New-PedidoEstado $origen
+    $anterior = Invoke-Http "/api/pedidos/$id" 200 $tokens['operador']
+    $usuario1 = 'operador'
+    if ($destino1 -eq 'Cancelado') { $usuario1 = 'distribuidor.norte' }
+    $bloqueo = Open-DistribuidorLock $norte
+    $peticiones = @()
+    try {
+        # Alternar quien entra primero ejercita ambos ordenes seriales en carreras con creacion.
+        if ($Crear -and $iteracion % 2 -eq 0) {
+            $peticiones += Start-PostPedido $pedidoValido $tokens['distribuidor.norte'] 5082
+            Wait-LockRequests $bloqueo 1
+        }
+        $patch = Start-PatchEstado $id $destino1 $usuario1 5081
+        $peticiones += $patch
+        if ($Crear) {
+            if ($iteracion % 2 -ne 0) {
+                Wait-LockRequests $bloqueo 1
+                $peticiones += Start-PostPedido $pedidoValido $tokens['distribuidor.norte'] 5082
+            }
+        } else { $peticiones += Start-PatchEstado $id $destino2 'operador' 5082 }
+        Wait-LockRequests $bloqueo 2
+        Assert-QA (-not $peticiones[0].Task.IsCompleted -and -not $peticiones[1].Task.IsCompleted) 'Mutacion evadio lock distribuidor.'
+        $inicio = [DateTimeOffset]::UtcNow
+        $bloqueo.Transaccion.Commit()
+        [void][System.Threading.Tasks.Task]::WhenAll([System.Threading.Tasks.Task[]]@($peticiones[0].Task, $peticiones[1].Task)).GetAwaiter().GetResult()
+        if ($Crear) {
+            $resultado = Complete-PatchEstado $patch
+            Assert-QA ($resultado.Status -eq 200) 'Liberacion perdio cambio de estado.'
+            $post = @($peticiones | Where-Object { $_ -ne $patch })[0]
+            $postStatus = Complete-PostPedido $post
+            Assert-QA ($postStatus -eq 201 -or $postStatus -eq 409) 'Creacion no tiene resultado serial.'
+            $filas = @(Get-QARows 'SELECT COUNT(*) AS Cantidad, SUM(CASE WHEN Estado IN (''Pendiente'', ''Aprobado'') THEN Total ELSE 0 END) AS Consumido FROM Pedidos')
+            $cantidad = 1; $consumido = 0
+            if ($postStatus -eq 201) { $cantidad = 2; $consumido = 145050 }
+            Assert-QA ($filas[0].Cantidad -eq $cantidad -and $filas[0].Consumido -eq $consumido) 'Creacion/liberacion incoherente.'
+        } else {
+            $resultados = @($peticiones | ForEach-Object { Complete-PatchEstado $_ })
+            Assert-QA ((@($resultados.Status | Sort-Object) -join ',') -eq '200,409') 'Carrera estados no produjo exactamente un200/un409.'
+            $resultado = @($resultados | Where-Object { $_.Status -eq 200 })[0]
+            $filas = @(Get-QARows 'SELECT COUNT(*) AS Cantidad FROM Pedidos')
+            Assert-QA ($filas[0].Cantidad -eq 1) 'Carrera estados altero cantidad pedidos.'
+        }
+        Assert-EstadoSQL $resultado.Body $resultado.Estado 'QA carrera' $anterior $inicio
+        Assert-CreditoSQL
+        Write-Host "PASS carrera estado $origen $destino1/$destino2 crear=$Crear iteracion=$iteracion ganador/SQL/credito coherentes"
+    } finally {
+        $bloqueo.Transaccion.Dispose(); $bloqueo.Conexion.Dispose()
+        foreach ($peticion in $peticiones) {
+            try { $peticion.Task.GetAwaiter().GetResult().Dispose() } finally { $peticion.Request.Dispose() }
+        }
+    }
+}
+
+function Test-Bloque4 {
+    # Bloque3 cambia solo el catalogo QA: restaurar precio para carreras de limite exacto.
+    Invoke-Sql $qaNombre 'UPDATE Productos SET PrecioPorGalon = 290.1 WHERE Id = @id' @{ '@id' = [Guid]'aaaaaaaa-0000-0000-0000-000000000001' }
+    $estados = @('Pendiente', 'Aprobado', 'Despachado', 'Rechazado', 'Cancelado')
+    foreach ($usuario in @('operador', 'distribuidor.norte', 'distribuidor.sur')) {
+        foreach ($owner in @($norte, $sur)) {
+            foreach ($origen in $estados) {
+                foreach ($destino in $estados) {
+                    Reset-Pedidos 145050
+                    $id = New-PedidoEstado $origen $owner
+                    $cuerpo = @{ nuevoEstado = $destino; motivo = '  QA matriz  ' }
+                    $visible = $usuario -eq 'operador' -or ($usuario -eq 'distribuidor.norte' -and $owner -eq $norte) -or
+                        ($usuario -eq 'distribuidor.sur' -and $owner -eq $sur)
+                    $permiso = ($usuario -eq 'operador' -and $destino -ne 'Cancelado') -or
+                        ($usuario -ne 'operador' -and $destino -eq 'Cancelado')
+                    $transicion = ($origen -eq 'Pendiente' -and $destino -in @('Aprobado', 'Rechazado', 'Cancelado')) -or
+                        ($origen -eq 'Aprobado' -and $destino -eq 'Despachado')
+                    if (-not $visible) { [void](Assert-PatchFallo $id $cuerpo 404 $usuario) }
+                    elseif (-not $permiso) { [void](Assert-PatchFallo $id $cuerpo 403 $usuario 'sin_permiso') }
+                    elseif (-not $transicion) { [void](Assert-PatchFallo $id $cuerpo 409 $usuario 'transicion_invalida') }
+                    else {
+                        $anterior = Invoke-Http "/api/pedidos/$id" 200 $tokens[$usuario]
+                        $inicio = [DateTimeOffset]::UtcNow
+                        $detalle = Invoke-Http "/api/pedidos/$id/estado" 200 $tokens[$usuario] -cuerpo $cuerpo -Patch
+                        Assert-EstadoSQL $detalle $destino 'QA matriz' $anterior $inicio
+                        $consumido = 0
+                        if ($destino -eq 'Aprobado') { $consumido = 145050 }
+                        Assert-Credito (Invoke-Http "/api/distribuidores/$owner/credito" 200 $tokens['operador']) $owner 145050 $consumido (145050 - $consumido)
+                    }
+                }
+            }
+        }
+    }
+    Write-Host 'PASS matriz completa 3 identidades/2 propietarios/5 origenes/5 destinos, fallos sin escrituras'
+    Reset-Pedidos 145050
+    $id = New-PedidoEstado
+    foreach ($cuerpo in @(@{}, @{ nuevoEstado = $null }, @{ nuevoEstado = '' }, @{ nuevoEstado = ' ' },
+        @{ nuevoEstado = '0' }, @{ nuevoEstado = '999' }, @{ nuevoEstado = 'aprobado' }, @{ nuevoEstado = ' Aprobado ' },
+        @{ nuevoEstado = 'Aprobado,Rechazado' }, @{ nuevoEstado = 'Inexistente' }, @{ nuevoEstado = 'Rechazado' },
+        @{ nuevoEstado = 'Rechazado'; motivo = '' }, @{ nuevoEstado = 'Rechazado'; motivo = '  ' },
+        @{ nuevoEstado = 'Rechazado'; motivo = ('x' * 1001) }, @{ nuevoEstado = 'Aprobado'; motivo = ('x' * 1001) })) {
+        [void](Assert-PatchFallo $id $cuerpo 400)
+    }
+    foreach ($json in @('null', '{', '', '{"nuevoEstado":1}', '{"nuevoEstado":true}', '{"nuevoEstado":{}}', '{"nuevoEstado":"Rechazado","motivo":1}')) {
+        [void](Assert-PatchFallo $id $json 400 -RawJson)
+    }
+    foreach ($invalido in @('no-es-guid', [Guid]::Empty.ToString())) {
+        [void](Assert-PatchFallo $invalido @{ nuevoEstado = 'Aprobado' } 400)
+    }
+    $missing = [Guid]::NewGuid().ToString()
+    $ajeno = Assert-PatchFallo $id @{ nuevoEstado = 'Cancelado' } 404 'distribuidor.sur'
+    $noExiste = Assert-PatchFallo $missing @{ nuevoEstado = 'Cancelado' } 404 'distribuidor.sur'
+    Assert-QA ($ajeno.title -eq $noExiste.title -and $ajeno.detail -eq $noExiste.detail) 'PATCH ajeno revela existencia.'
+    [void](Assert-PatchFallo $missing @{ nuevoEstado = 'Aprobado' } 404)
+    foreach ($token in @('', 'token-invalido')) {
+        $digest = Get-PedidosDigest
+        [void](Invoke-Http "/api/pedidos/$id/estado" 401 $token -cuerpo @{ nuevoEstado = 'Aprobado' } -Patch)
+        Assert-QA ((Get-PedidosDigest) -eq $digest) 'PATCH sin identidad escribio.'
+    }
+    $anterior = Invoke-Http "/api/pedidos/$id" 200 $tokens['operador']
+    $inicio = [DateTimeOffset]::UtcNow
+    $detalle = Invoke-Http "/api/pedidos/$id/estado" 200 $tokens['operador'] -Patch -cuerpo @{ nuevoEstado = 'Rechazado'; motivo = ('x' * 1000) }
+    Assert-EstadoSQL $detalle 'Rechazado' ('x' * 1000) $anterior $inicio
+    foreach ($accion in @('Aprobado', 'Cancelado')) {
+        Reset-Pedidos 145050; $id = New-PedidoEstado
+        $usuario = 'operador'; if ($accion -eq 'Cancelado') { $usuario = 'distribuidor.norte' }
+        [void](Invoke-Http "/api/pedidos/$id/estado" 200 $tokens[$usuario] -Patch -cuerpo @{ nuevoEstado = $accion })
+        Assert-CreditoSQL
+        if ($accion -eq 'Aprobado') {
+            [void](Invoke-Http "/api/pedidos/$id/estado" 200 $tokens['operador'] -Patch -cuerpo @{ nuevoEstado = 'Despachado' })
+            Assert-CreditoSQL
+        }
+    }
+    foreach ($carrera in @(@('Pendiente', 'Aprobado', 'Aprobado'), @('Pendiente', 'Aprobado', 'Rechazado'),
+        @('Pendiente', 'Cancelado', 'Aprobado'), @('Aprobado', 'Despachado', 'Despachado'))) {
+        for ($i = 1; $i -le 10; $i++) { Invoke-CarreraEstado $carrera[0] $carrera[1] $carrera[2] $i }
+    }
+    foreach ($carrera in @(@('Pendiente', 'Cancelado'), @('Aprobado', 'Despachado'))) {
+        for ($i = 1; $i -le 10; $i++) { Invoke-CarreraEstado $carrera[0] $carrera[1] '' $i -Crear }
+    }
+    Reset-Pedidos 145050
+    $id = New-PedidoEstado
+    $surId = New-PedidoEstado 'Pendiente' $sur
+    $digest = Get-PedidosDigest
+    $bloqueo = Open-DistribuidorLock $norte
+    $cancelacion = New-Object System.Threading.CancellationTokenSource
+    $pendiente = $null
+    try {
+        $pendiente = Start-PatchEstado $id 'Aprobado' 'operador' 5081 $cancelacion.Token
+        Wait-LockRequests $bloqueo 1
+        [void](Invoke-Http "/api/pedidos/$surId/estado" 200 $tokens['distribuidor.sur'] -cuerpo @{ nuevoEstado = 'Cancelado' } -Patch -puerto 5082)
+        Assert-QA (-not $pendiente.Task.IsCompleted) 'PATCH no demostro independencia entre distribuidores.'
+        $digest = Get-PedidosDigest
+        $cancelacion.Cancel()
+        $cancelado = $false
+        try { [void]$pendiente.Task.GetAwaiter().GetResult() } catch [System.OperationCanceledException] { $cancelado = $true }
+        Assert-QA $cancelado 'PATCH esperando bloqueo no cancelo.'
+        Start-Sleep -Milliseconds 250
+        $bloqueo.Transaccion.Commit()
+        Assert-QA ((Get-PedidosDigest) -eq $digest) 'PATCH cancelado dejo escrituras.'
+        [void](Invoke-Http "/api/pedidos/$id/estado" 200 $tokens['operador'] -cuerpo @{ nuevoEstado = 'Aprobado' } -Patch -puerto 5082)
+        Assert-CreditoSQL
+        Write-Host 'PASS PATCH Sur independiente y cancelacion Norte: sin escrituras, rollback y lock liberado'
+    } finally {
+        $bloqueo.Transaccion.Dispose(); $bloqueo.Conexion.Dispose(); $cancelacion.Dispose()
+        if ($pendiente) { $pendiente.Request.Dispose() }
+    }
+    Reset-Pedidos 145050
+    $id = New-PedidoEstado
+    $prueba = Start-ApiProceso $id -PruebaConcurrencia
+    Assert-QA ($prueba.WaitForExit(120000)) 'Timeout prueba dos contextos EF.'
+    Assert-QA ($prueba.ExitCode -eq 0) 'Prueba dos contextos EF fallo (logs privados en memoria).'
+    $final = @(Get-QARows 'SELECT Estado, MotivoRechazo FROM Pedidos WHERE Id = @id' @{ '@id' = [Guid]$id })[0]
+    Assert-QA ($final.Estado -eq 'Aprobado' -and $null -eq $final.MotivoRechazo) 'Token EF no preservo ganador SQL.'
+    Assert-CreditoSQL
+    Write-Host 'PASS dos AppDbContext SQL: segundo SaveChanges lanza DbUpdateConcurrencyException y ganador intacto'
+}
+
 function Test-Bloque2 {
     Reset-Pedidos 10000000
     $producto = 'aaaaaaaa-0000-0000-0000-000000000001'
@@ -668,7 +924,11 @@ SELECT @pedido, Id, Nombre, 500, PrecioPorGalon, 145050.00 FROM Productos WHERE 
     [void](Invoke-Http '/api/productos' 200 $tokens['operador'] -puerto 5082)
     if ($Bloque -ge 2) { Test-Bloque2 }
     if ($Bloque -ge 3) { Test-Bloque3 }
+    if ($Bloque -ge 4) { Test-Bloque4 }
     Write-Host "PASS bloque $Bloque SQL/HTTP real"
+} catch {
+    # No propagar errores tecnicos de conexion/comando ni logs hijos que puedan contener secretos.
+    throw 'QA de pedidos fallo. Revisa el ultimo caso PASS; detalles tecnicos sensibles omitidos.'
 } finally {
     $erroresLimpieza = New-Object System.Collections.Generic.List[string]
     foreach ($entrada in $procesos) {

@@ -55,6 +55,26 @@ public class PedidosController : ControllerBase
         return Ok(respuesta);
     }
 
+    [HttpPatch("{id}/estado")]
+    public async Task<ActionResult<PedidoDetalleRespuesta>> CambiarEstado([Required] Guid? id,
+        CambiarEstadoSolicitud solicitud, CancellationToken cancellationToken)
+    {
+        if (id == Guid.Empty)
+        {
+            ModelState.AddModelError(nameof(id), "El identificador del pedido no puede estar vacio.");
+            return ValidationProblem(ModelState);
+        }
+        var respuesta = await _pedidos.CambiarEstadoAsync(id!.Value, solicitud,
+            _lectorUsuario.Obtener(), cancellationToken);
+        if (respuesta == null)
+        {
+            return Problem(statusCode: StatusCodes.Status404NotFound,
+                title: "Recurso no encontrado", detail: "El pedido no existe o no esta disponible.",
+                instance: HttpContext.Request.Path);
+        }
+        return Ok(respuesta);
+    }
+
     [HttpPost]
     [Authorize(Roles = "Distribuidor")]
     public async Task<ActionResult<PedidoDetalleRespuesta>> Crear(CrearPedidoSolicitud solicitud,

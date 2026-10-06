@@ -16,6 +16,7 @@ public class ErroresMiddlewareTests
     [InlineData("sin_permiso", 403)]
     [InlineData("credito_insuficiente", 409)]
     [InlineData("transicion_invalida", 409)]
+    [InlineData("conflicto_concurrencia", 409)]
     public async Task InvokeAsync_TraduceReglasAProblemDetails(string codigo, int status)
     {
         using var servicios = new ServiceCollection().AddLogging().AddProblemDetails().BuildServiceProvider();

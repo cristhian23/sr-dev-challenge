@@ -102,6 +102,51 @@ public class PedidosService
             }).SingleOrDefaultAsync(cancellationToken);
     }
 
+    public async Task<PedidoDetalleRespuesta?> CambiarEstadoAsync(Guid id, CambiarEstadoSolicitud solicitud,
+        UsuarioActual usuarioActual, CancellationToken cancellationToken)
+    {
+        // Solo resolver el propietario sin tracking: el estado se lee despues de obtener el bloqueo.
+        var distribuidorId = await ConsultarVisibles(usuarioActual).Where(pedido => pedido.Id == id)
+            .Select(pedido => (Guid?)pedido.DistribuidorId).SingleOrDefaultAsync(cancellationToken);
+        if (!distribuidorId.HasValue)
+        {
+            return null;
+        }
+        await using var transaccion = await _db.Database.BeginTransactionAsync(
+            IsolationLevel.ReadCommitted, cancellationToken);
+        try
+        {
+            var distribuidor = await _db.Distribuidores
+                .FromSql($"SELECT * FROM Distribuidores WITH (UPDLOCK, HOLDLOCK) WHERE Id = {distribuidorId.Value}")
+                .AsNoTracking().SingleOrDefaultAsync(cancellationToken);
+            var pedido = await ConsultarVisibles(usuarioActual).AsTracking().Include(pedido => pedido.Lineas)
+                .SingleOrDefaultAsync(pedido => pedido.Id == id && pedido.DistribuidorId == distribuidorId.Value,
+                    cancellationToken);
+            if (distribuidor == null || pedido == null)
+            {
+                await transaccion.RollbackAsync(CancellationToken.None);
+                return null;
+            }
+
+            pedido.CambiarEstado(Enum.Parse<EstadoPedido>(solicitud.NuevoEstado!), usuarioActual,
+                DateTimeOffset.UtcNow, solicitud.Motivo);
+            await _db.SaveChangesAsync(cancellationToken);
+            await transaccion.CommitAsync(cancellationToken);
+            return CrearRespuesta(pedido, distribuidor.Nombre);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaccion.RollbackAsync(CancellationToken.None);
+            throw new ReglaNegocioException("conflicto_concurrencia",
+                "El pedido cambio durante la operacion. Consulta su estado actual antes de volver a intentar.");
+        }
+        catch
+        {
+            await transaccion.RollbackAsync(CancellationToken.None);
+            throw;
+        }
+    }
+
     private IQueryable<Pedido> ConsultarVisibles(UsuarioActual usuarioActual)
     {
         var consulta = _db.Pedidos.AsNoTracking();
