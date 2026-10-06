@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Refidomsa.Api.DTOs.Pedidos;
@@ -19,6 +20,39 @@ public class PedidosController : ControllerBase
     {
         _pedidos = pedidos;
         _lectorUsuario = lectorUsuario;
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<ListaPedidosRespuesta>> Listar([FromQuery] ListaPedidosSolicitud solicitud,
+        CancellationToken cancellationToken)
+    {
+        var respuesta = await _pedidos.ListarAsync(solicitud, _lectorUsuario.Obtener(), cancellationToken);
+        if (respuesta == null)
+        {
+            return Problem(statusCode: StatusCodes.Status404NotFound,
+                title: "Recurso no encontrado", detail: "El pedido no existe o no esta disponible.",
+                instance: HttpContext.Request.Path);
+        }
+        return Ok(respuesta);
+    }
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<PedidoDetalleRespuesta>> Obtener(
+        [Required] Guid? id, CancellationToken cancellationToken)
+    {
+        if (id == Guid.Empty)
+        {
+            ModelState.AddModelError(nameof(id), "El identificador del pedido no puede estar vacio.");
+            return ValidationProblem(ModelState);
+        }
+        var respuesta = await _pedidos.ObtenerAsync(id!.Value, _lectorUsuario.Obtener(), cancellationToken);
+        if (respuesta == null)
+        {
+            return Problem(statusCode: StatusCodes.Status404NotFound,
+                title: "Recurso no encontrado", detail: "El pedido no existe o no esta disponible.",
+                instance: HttpContext.Request.Path);
+        }
+        return Ok(respuesta);
     }
 
     [HttpPost]

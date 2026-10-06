@@ -19,6 +19,99 @@ public class PedidosService
         _db = db;
     }
 
+    public async Task<ListaPedidosRespuesta?> ListarAsync(ListaPedidosSolicitud solicitud,
+        UsuarioActual usuarioActual, CancellationToken cancellationToken)
+    {
+        if (usuarioActual.Rol == Rol.Distribuidor && solicitud.DistribuidorId.HasValue
+            && solicitud.DistribuidorId != usuarioActual.DistribuidorId)
+        {
+            return null;
+        }
+
+        var consulta = ConsultarVisibles(usuarioActual);
+        if (solicitud.DistribuidorId.HasValue)
+        {
+            consulta = consulta.Where(pedido => pedido.DistribuidorId == solicitud.DistribuidorId.Value);
+        }
+        if (solicitud.Estado != null)
+        {
+            var estado = Enum.Parse<EstadoPedido>(solicitud.Estado);
+            consulta = consulta.Where(pedido => pedido.Estado == estado);
+        }
+        var desde = solicitud.ObtenerDesde();
+        var hasta = solicitud.ObtenerHasta();
+        if (desde.HasValue)
+        {
+            consulta = consulta.Where(pedido => pedido.FechaCreacion >= desde.Value);
+        }
+        if (hasta.HasValue)
+        {
+            consulta = consulta.Where(pedido => pedido.FechaCreacion < hasta.Value);
+        }
+
+        // La solicitud HTTP valida este limite; checked evita overflow tambien ante llamadas internas.
+        var desplazamiento = checked((solicitud.Pagina - 1) * solicitud.TamanoPagina);
+        var total = await consulta.CountAsync(cancellationToken);
+        var items = await consulta.OrderByDescending(pedido => pedido.FechaCreacion)
+            .ThenByDescending(pedido => pedido.Id).Skip(desplazamiento).Take(solicitud.TamanoPagina)
+            .Select(pedido => new PedidoResumenRespuesta
+            {
+                Id = pedido.Id,
+                DistribuidorId = pedido.DistribuidorId,
+                NombreDistribuidor = _db.Distribuidores.Where(distribuidor => distribuidor.Id == pedido.DistribuidorId)
+                    .Select(distribuidor => distribuidor.Nombre).First(),
+                FechaEntrega = pedido.FechaEntrega,
+                FechaCreacion = pedido.FechaCreacion,
+                FechaCambioEstado = pedido.FechaCambioEstado,
+                Total = pedido.Total,
+                Estado = pedido.Estado
+            }).ToListAsync(cancellationToken);
+        return new ListaPedidosRespuesta
+        {
+            Items = items,
+            Pagina = solicitud.Pagina,
+            TamanoPagina = solicitud.TamanoPagina,
+            TotalRegistros = total
+        };
+    }
+
+    public async Task<PedidoDetalleRespuesta?> ObtenerAsync(Guid id, UsuarioActual usuarioActual,
+        CancellationToken cancellationToken)
+    {
+        return await ConsultarVisibles(usuarioActual).Where(pedido => pedido.Id == id)
+            .Select(pedido => new PedidoDetalleRespuesta
+            {
+                Id = pedido.Id,
+                DistribuidorId = pedido.DistribuidorId,
+                NombreDistribuidor = _db.Distribuidores.Where(distribuidor => distribuidor.Id == pedido.DistribuidorId)
+                    .Select(distribuidor => distribuidor.Nombre).First(),
+                FechaEntrega = pedido.FechaEntrega,
+                FechaCreacion = pedido.FechaCreacion,
+                FechaCambioEstado = pedido.FechaCambioEstado,
+                Total = pedido.Total,
+                Estado = pedido.Estado,
+                MotivoRechazo = pedido.MotivoRechazo,
+                Lineas = pedido.Lineas.Select(linea => new LineaPedidoRespuesta
+                {
+                    ProductoId = linea.ProductoId,
+                    NombreProducto = linea.NombreProducto,
+                    Galones = linea.Galones,
+                    PrecioPorGalon = linea.PrecioPorGalon,
+                    Subtotal = linea.Subtotal
+                }).ToList()
+            }).SingleOrDefaultAsync(cancellationToken);
+    }
+
+    private IQueryable<Pedido> ConsultarVisibles(UsuarioActual usuarioActual)
+    {
+        var consulta = _db.Pedidos.AsNoTracking();
+        if (usuarioActual.Rol == Rol.Distribuidor)
+        {
+            consulta = consulta.Where(pedido => pedido.DistribuidorId == usuarioActual.DistribuidorId);
+        }
+        return consulta;
+    }
+
     public async Task<PedidoDetalleRespuesta?> CrearAsync(CrearPedidoSolicitud solicitud,
         UsuarioActual usuarioActual, CancellationToken cancellationToken)
     {

@@ -52,6 +52,30 @@ public class CrearPedidoSolicitudTests
             error => error.MemberNames.Contains("ProductoId"));
     }
 
+    [Theory]
+    [InlineData("500.00000000000000000000000000001")]
+    [InlineData("500.1234567")]
+    [InlineData("5000000001e-7")]
+    [InlineData("1e100")]
+    [InlineData("1e-100")]
+    public void GalonesJSON_RechazaPrecisionAntesDeConversionDecimal(string numero)
+    {
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<CrearLineaPedidoSolicitud>(
+            "{\"galones\":" + numero + "}", new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+    }
+
+    [Theory]
+    [InlineData("500.123456000000000000000000000000", "500.123456")]
+    [InlineData("500123456e-6", "500.123456")]
+    [InlineData("5e2", "500")]
+    [InlineData("0.000000000000000000000000000000", "0")]
+    public void GalonesJSON_ConservaNumeroExactoConExponentesOCeros(string numero, string esperado)
+    {
+        var linea = JsonSerializer.Deserialize<CrearLineaPedidoSolicitud>("{\"galones\":" + numero + "}",
+            new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        Assert.Equal(decimal.Parse(esperado, System.Globalization.CultureInfo.InvariantCulture), linea.Galones);
+    }
+
     [Fact]
     public void Solicitud_RequiereFechaYLineasYRechazaLineaNula()
     {

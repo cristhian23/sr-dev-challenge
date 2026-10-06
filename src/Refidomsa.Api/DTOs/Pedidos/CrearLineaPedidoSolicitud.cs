@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text.Json.Serialization;
 
 namespace Refidomsa.Api.DTOs.Pedidos;
 
@@ -8,6 +9,7 @@ public class CrearLineaPedidoSolicitud : IValidatableObject
     public Guid? ProductoId { get; set; }
 
     [Required]
+    [JsonConverter(typeof(GalonesJsonConverter))]
     public decimal? Galones { get; set; }
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)

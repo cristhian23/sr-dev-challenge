@@ -1,5 +1,5 @@
 param(
-    [ValidateSet(1, 2)]
+    [ValidateSet(1, 2, 3)]
     [int]$Bloque = 1
 )
 
@@ -114,7 +114,7 @@ function Invoke-Http([string]$ruta, [int]$status, [string]$token = '', [object]$
                 # PS5.1 ConvertFrom-Json rechaza la clave vacia de errores de validacion del body.
                 $serializador = New-Object System.Web.Script.Serialization.JavaScriptSerializer
                 $problema = $serializador.DeserializeObject($texto)
-                Assert-QA ($problema.status -eq $status -and $problema.title -and $problema.instance -eq $ruta) 'Contrato ProblemDetails incorrecto.'
+                Assert-QA ($problema.status -eq $status -and $problema.title -and $problema.instance -eq ($ruta -split '\?', 2)[0]) 'Contrato ProblemDetails incorrecto.'
                 if ($status -ne 400) { Assert-QA ($problema.detail) 'ProblemDetails sin detail.' }
                 if ($status -eq 401) { Assert-QA ($respuesta.Headers.WwwAuthenticate.ToString() -eq 'Bearer') 'Falta WWW-Authenticate Bearer.' }
             }
@@ -147,6 +147,7 @@ function Assert-Credito($respuesta, [string]$id, [decimal]$limite, [decimal]$con
 
 function Get-QARows([string]$sql, [hashtable]$parametros = @{}) {
     $filas = (Invoke-Sql $qaNombre ($sql + ' FOR JSON PATH, INCLUDE_NULL_VALUES') $parametros -Texto) | ConvertFrom-Json
+    if ($null -eq $filas) { return }
     return $filas
 }
 
@@ -297,10 +298,156 @@ function Invoke-CarreraCredito([bool]$consumoPrevio, [int]$iteracion) {
         $bloqueo.Transaccion.Dispose()
         $bloqueo.Conexion.Dispose()
         foreach ($peticion in $peticiones) {
-            if (-not $peticion.Task.IsCompleted) { try { $peticion.Task.GetAwaiter().GetResult().Dispose() } catch { } }
+            try { $peticion.Task.GetAwaiter().GetResult().Dispose() } catch [System.OperationCanceledException] { }
             $peticion.Request.Dispose()
         }
     }
+}
+
+function Assert-ListaSQL([string]$query = '', [string]$usuario = 'operador', [string]$where = '1=1',
+    [hashtable]$parametros = @{}, [int]$pagina = 1, [int]$tamano = 10) {
+    $ruta = '/api/pedidos'
+    if ($query) { $ruta += '?' + $query }
+    $lista = Invoke-Http $ruta 200 $tokens[$usuario]
+    Assert-QA ((@($lista.PSObject.Properties.Name | Sort-Object) -join ',') -eq
+        'items,pagina,tamanoPagina,totalRegistros') 'Lista fuera de contrato.'
+    $esperados = @(Get-QARows ("SELECT p.Id, p.DistribuidorId, d.Nombre AS NombreDistribuidor, p.FechaEntrega, p.FechaCreacion, p.FechaCambioEstado, p.Total, p.Estado FROM Pedidos p JOIN Distribuidores d ON d.Id = p.DistribuidorId WHERE $where ORDER BY p.FechaCreacion DESC, p.Id DESC") $parametros)
+    Assert-QA ($lista.pagina -eq $pagina -and $lista.tamanoPagina -eq $tamano -and
+        $lista.totalRegistros -eq $esperados.Count) 'Paginacion o total incorrecto/ajeno.'
+    $offset = ($pagina - 1) * $tamano
+    $cantidad = [Math]::Max(0, [Math]::Min($tamano, $esperados.Count - $offset))
+    Assert-QA (@($lista.items).Count -eq $cantidad) 'Cantidad paginada incorrecta.'
+    for ($i = 0; $i -lt $cantidad; $i++) {
+        $actual = $lista.items[$i]
+        $sql = $esperados[$offset + $i]
+        Assert-QA ((@($actual.PSObject.Properties.Name | Sort-Object) -join ',') -eq
+            'distribuidorId,estado,fechaCambioEstado,fechaCreacion,fechaEntrega,id,nombreDistribuidor,total') 'Resumen expone lineas/campos no requeridos.'
+        foreach ($campo in @('id', 'distribuidorId', 'nombreDistribuidor', 'estado', 'total')) {
+            Assert-QA ($actual.$campo -eq $sql.$campo) "Resumen $campo u orden difiere de SQL."
+        }
+        foreach ($campo in @('fechaEntrega', 'fechaCreacion', 'fechaCambioEstado')) {
+            Assert-QA ([DateTimeOffset]$actual.$campo -eq [DateTimeOffset]$sql.$campo) "Resumen $campo difiere de SQL."
+        }
+    }
+    return $lista
+}
+
+function Test-Bloque3 {
+    Reset-Pedidos 10000000
+    $estados = @('Pendiente', 'Aprobado', 'Despachado', 'Rechazado', 'Cancelado')
+    $fixtures = @()
+    for ($i = 0; $i -lt 10; $i++) {
+        $propietario = $norte
+        if ($i -ge 5) { $propietario = $sur }
+        $id = [Guid]::NewGuid()
+        # Fechas repetidas obligan a comprobar el desempate Id DESC de SQL Server.
+        $creacion = [DateTimeOffset]::Parse('2026-09-01T04:00:00Z').AddDays($i % 3)
+        $estado = $estados[$i % 5]
+        Invoke-Sql $qaNombre @'
+INSERT INTO Pedidos (Id, DistribuidorId, FechaEntrega, FechaCreacion, FechaCambioEstado, Total, Estado, MotivoRechazo)
+VALUES (@id, @distribuidor, @entrega, @creacion, @cambio, 145050, @estado,
+ CASE WHEN @estado = 'Rechazado' THEN 'QA motivo historico' ELSE NULL END);
+INSERT INTO LineasPedido (PedidoId, ProductoId, NombreProducto, Galones, PrecioPorGalon, Subtotal)
+SELECT @id, Id, Nombre, 500, PrecioPorGalon, 145050 FROM Productos WHERE Id = @producto;
+'@ @{ '@id' = $id; '@distribuidor' = [Guid]$propietario; '@entrega' = $creacion.AddDays(7);
+        '@creacion' = $creacion; '@cambio' = $creacion.AddHours(1); '@estado' = $estado;
+        '@producto' = [Guid]'aaaaaaaa-0000-0000-0000-000000000001' }
+        $fixtures += [PSCustomObject]@{ Id = $id.ToString(); Propietario = $propietario; Estado = $estado }
+    }
+    [void](Assert-ListaSQL)
+    foreach ($usuario in @('distribuidor.norte', 'distribuidor.sur')) {
+        $propietario = $norte
+        if ($usuario -eq 'distribuidor.sur') { $propietario = $sur }
+        $params = @{ '@owner' = [Guid]$propietario }
+        [void](Assert-ListaSQL '' $usuario 'p.DistribuidorId = @owner' $params)
+        [void](Assert-ListaSQL "distribuidorId=$propietario" $usuario 'p.DistribuidorId = @owner' $params)
+        foreach ($estado in $estados) {
+            [void](Assert-ListaSQL "estado=$estado" $usuario 'p.DistribuidorId = @owner AND p.Estado = @estado' @{ '@owner' = [Guid]$propietario; '@estado' = $estado })
+        }
+    }
+    foreach ($estado in $estados) {
+        [void](Assert-ListaSQL "estado=$estado" 'operador' 'p.Estado = @estado' @{ '@estado' = $estado })
+    }
+    foreach ($propietario in @($norte, $sur, [Guid]::NewGuid().ToString())) {
+        [void](Assert-ListaSQL "distribuidorId=$propietario" 'operador' 'p.DistribuidorId = @id' @{ '@id' = [Guid]$propietario })
+    }
+    $desde = [Uri]::EscapeDataString('2026-09-01T00:00:00-04:00')
+    $hasta = [Uri]::EscapeDataString('2026-09-02T00:00:00-04:00')
+    $rango = @{ '@desde' = [DateTimeOffset]::Parse('2026-09-01T04:00:00Z'); '@hasta' = [DateTimeOffset]::Parse('2026-09-02T04:00:00Z') }
+    [void](Assert-ListaSQL "desde=$desde" 'operador' 'p.FechaCreacion >= @desde' @{ '@desde' = $rango['@desde'] })
+    [void](Assert-ListaSQL "hasta=$hasta" 'operador' 'p.FechaCreacion < @hasta' @{ '@hasta' = $rango['@hasta'] })
+    [void](Assert-ListaSQL "desde=$desde&hasta=$hasta" 'operador' 'p.FechaCreacion >= @desde AND p.FechaCreacion < @hasta' $rango)
+    $desdePositivo = [Uri]::EscapeDataString('2026-09-01T06:00:00+02:00')
+    [void](Assert-ListaSQL "desde=$desdePositivo&hasta=$hasta" 'operador' 'p.FechaCreacion >= @desde AND p.FechaCreacion < @hasta' $rango)
+    [void](Assert-ListaSQL "desde=$desde&hasta=$hasta&distribuidorId=$sur&estado=Rechazado" 'operador' `
+        'p.FechaCreacion >= @desde AND p.FechaCreacion < @hasta AND p.DistribuidorId = @id AND p.Estado = @estado' `
+        @{ '@desde' = $rango['@desde']; '@hasta' = $rango['@hasta']; '@id' = [Guid]$sur; '@estado' = 'Rechazado' })
+    [void](Assert-ListaSQL "desde=$desde&hasta=$hasta&estado=Pendiente" 'distribuidor.norte' `
+        'p.FechaCreacion >= @desde AND p.FechaCreacion < @hasta AND p.DistribuidorId = @id AND p.Estado = @estado' `
+        @{ '@desde' = $rango['@desde']; '@hasta' = $rango['@hasta']; '@id' = [Guid]$norte; '@estado' = 'Pendiente' })
+    $ids = @()
+    for ($pagina = 1; $pagina -le 4; $pagina++) {
+        $lista = Assert-ListaSQL "pagina=$pagina&tamanoPagina=3" 'operador' '1=1' @{} $pagina 3
+        $ids += @($lista.items | ForEach-Object { $_.id })
+    }
+    Assert-QA ($ids.Count -eq 10 -and @($ids | Select-Object -Unique).Count -eq 10) 'Paginas duplican/omiten pedidos.'
+    for ($pagina = 1; $pagina -le 4; $pagina++) {
+        [void](Assert-ListaSQL "pagina=$pagina&tamanoPagina=2" 'distribuidor.norte' 'p.DistribuidorId = @id' @{ '@id' = [Guid]$norte } $pagina 2)
+    }
+    [void](Assert-ListaSQL 'pagina=5&tamanoPagina=3' 'operador' '1=1' @{} 5 3)
+    [void](Assert-ListaSQL 'tamanoPagina=1' 'operador' '1=1' @{} 1 1)
+    [void](Assert-ListaSQL 'tamanoPagina=100' 'operador' '1=1' @{} 1 100)
+    [void](Assert-ListaSQL 'pagina=2147483647&tamanoPagina=1' 'operador' '1=1' @{} 2147483647 1)
+    foreach ($query in @('pagina=0', 'pagina=-1', 'pagina=no', 'pagina=2147483648', 'pagina=2147483647',
+        'tamanoPagina=0', 'tamanoPagina=101', 'tamanoPagina=-1', 'tamanoPagina=no',
+        'estado=Inexistente', 'estado=0', 'estado=999', 'estado=Pendiente,Aprobado',
+        'distribuidorId=no', 'distribuidorId=00000000-0000-0000-0000-000000000000',
+        'desde=no', 'hasta=no', 'desde=2026-09-01', 'hasta=2026-09-01T00:00:00',
+        "desde=$hasta&hasta=$desde", "desde=$desde&hasta=$desde")) {
+        [void](Invoke-Http "/api/pedidos?$query" 400 $tokens['operador'])
+    }
+    $otro = Invoke-Http "/api/pedidos?distribuidorId=$sur" 404 $tokens['distribuidor.norte']
+    $missing = [Guid]::NewGuid().ToString()
+    $noExiste = Invoke-Http "/api/pedidos?distribuidorId=$missing" 404 $tokens['distribuidor.norte']
+    Assert-QA ($otro.title -eq $noExiste.title -and $otro.detail -eq $noExiste.detail) 'Filtro ajeno revela existencia.'
+    foreach ($fixture in $fixtures) {
+        $detalle = Invoke-Http "/api/pedidos/$($fixture.Id)" 200 $tokens['operador']
+        Assert-QA ($detalle.id -eq $fixture.Id -and $detalle.distribuidorId -eq $fixture.Propietario -and
+            $detalle.estado -eq $fixture.Estado -and $detalle.total -eq 145050 -and $detalle.lineas.Count -eq 1) 'Detalle incorrecto.'
+        Assert-QA ((@($detalle.PSObject.Properties.Name | Sort-Object) -join ',') -eq
+            'distribuidorId,estado,fechaCambioEstado,fechaCreacion,fechaEntrega,id,lineas,motivoRechazo,nombreDistribuidor,total') 'Detalle expone datos fuera de contrato.'
+        $sql = @(Get-QARows 'SELECT d.Nombre, p.MotivoRechazo FROM Pedidos p JOIN Distribuidores d ON d.Id = p.DistribuidorId WHERE p.Id = @id' @{ '@id' = [Guid]$fixture.Id })
+        Assert-QA ($detalle.nombreDistribuidor -eq $sql[0].Nombre -and $detalle.motivoRechazo -eq $sql[0].MotivoRechazo) 'Detalle nombre/motivo incorrecto.'
+        $usuario = 'distribuidor.norte'
+        if ($fixture.Propietario -eq $sur) { $usuario = 'distribuidor.sur' }
+        [void](Invoke-Http "/api/pedidos/$($fixture.Id)" 200 $tokens[$usuario])
+    }
+    $ajenoId = $fixtures[5].Id
+    $ajeno = Invoke-Http "/api/pedidos/$ajenoId" 404 $tokens['distribuidor.norte']
+    $inexistente = Invoke-Http "/api/pedidos/$missing" 404 $tokens['distribuidor.norte']
+    Assert-QA ($ajeno.title -eq $inexistente.title -and $ajeno.detail -eq $inexistente.detail) 'Detalle ajeno revela existencia.'
+    [void](Invoke-Http "/api/pedidos/$($fixtures[0].Id)" 404 $tokens['distribuidor.sur'])
+    [void](Invoke-Http "/api/pedidos/$missing" 404 $tokens['operador'])
+    foreach ($id in @('no-es-guid', [Guid]::Empty.ToString())) {
+        [void](Invoke-Http "/api/pedidos/$id" 400 $tokens['operador'])
+    }
+    foreach ($ruta in @('/api/pedidos', "/api/pedidos/$($fixtures[0].Id)")) {
+        [void](Invoke-Http $ruta 401)
+        [void](Invoke-Http $ruta 401 'token-invalido')
+    }
+    $rutaSnapshot = "/api/pedidos/$($fixtures[0].Id)"
+    $historico = Invoke-Http $rutaSnapshot 200 $tokens['distribuidor.norte']
+    Invoke-Sql $qaNombre 'UPDATE Productos SET Nombre = @nombre, PrecioPorGalon = 999 WHERE Id = @id' `
+        @{ '@nombre' = 'QA catalogo nuevo'; '@id' = [Guid]'aaaaaaaa-0000-0000-0000-000000000001' }
+    $actual = Invoke-Http $rutaSnapshot 200 $tokens['distribuidor.norte']
+    Assert-QA (($historico | ConvertTo-Json -Depth 10 -Compress) -eq ($actual | ConvertTo-Json -Depth 10 -Compress)) 'GET modifico snapshots por cambios de catalogo.'
+    $lineaSQL = @(Get-QARows 'SELECT ProductoId, NombreProducto, Galones, PrecioPorGalon, Subtotal FROM LineasPedido WHERE PedidoId = @id' @{ '@id' = [Guid]$fixtures[0].Id })
+    foreach ($campo in @('productoId', 'nombreProducto', 'galones', 'precioPorGalon', 'subtotal')) {
+        Assert-QA ($actual.lineas[0].$campo -eq $lineaSQL[0].$campo) 'Snapshot detalle difiere de SQL.'
+    }
+    Assert-QA ((@($actual.lineas[0].PSObject.Properties.Name | Sort-Object) -join ',') -eq
+        'galones,nombreProducto,precioPorGalon,productoId,subtotal') 'Linea expone entidad.'
+    Write-Host 'PASS bloque3 scope antes de paginar, filtros/rangos, snapshots y contratos SQL/HTTP'
 }
 
 function Test-Bloque2 {
@@ -346,7 +493,8 @@ function Test-Bloque2 {
         @{ fechaEntrega = $fecha.ToString('o'); lineas = @(@{ productoId = $producto }) })) {
         Assert-NoEscritura $invalido
     }
-    foreach ($json in @('null', '{', '{"fechaEntrega":"2026-10-08T12:00:00Z","lineas":[{"productoId":"aaaaaaaa-0000-0000-0000-000000000001","galones":1e100}]}')) {
+    foreach ($json in @('null', '{', '{"fechaEntrega":"2026-10-08T12:00:00Z","lineas":[{"productoId":"aaaaaaaa-0000-0000-0000-000000000001","galones":1e100}]}',
+        '{"fechaEntrega":"2026-10-08T12:00:00Z","lineas":[{"productoId":"aaaaaaaa-0000-0000-0000-000000000001","galones":500.00000000000000000000000000001}]}')) {
         Assert-NoEscritura $json -RawJson
     }
     Assert-NoEscritura @{ fechaEntrega = $fecha.ToString('o'); lineas = @(
@@ -519,6 +667,7 @@ SELECT @pedido, Id, Nombre, 500, PrecioPorGalon, 145050.00 FROM Productos WHERE 
     [void](Invoke-Http '/api/distribuidores/00000000-0000-0000-0000-000000000000/credito' 400 $tokens['operador'])
     [void](Invoke-Http '/api/productos' 200 $tokens['operador'] -puerto 5082)
     if ($Bloque -ge 2) { Test-Bloque2 }
+    if ($Bloque -ge 3) { Test-Bloque3 }
     Write-Host "PASS bloque $Bloque SQL/HTTP real"
 } finally {
     $erroresLimpieza = New-Object System.Collections.Generic.List[string]
