@@ -2,9 +2,9 @@
 
 ## Estado actual
 
-Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 144 pruebas unitarias, un diagnostico reproducible contra la base real y QA de login por HTTP.
+Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 159 pruebas unitarias, diagnostico de persistencia y QA aislado SQL/HTTP reproducible para productos y credito.
 
-Los tres usuarios semilla pueden iniciar sesion y recibir un JWT. Todavia NO hay endpoints de pedidos/productos/credito, autorizacion por recurso ni frontend. No es una entrega completa del reto.
+Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito; el operador puede consultar cualquiera. Todavia NO hay endpoints de pedidos ni frontend. No es una entrega completa del reto.
 
 ## Requisitos locales
 
@@ -72,7 +72,7 @@ Los RNC, distribuidores y precios son ficticios. Los productos son Gasolina Prem
 - 400 ValidationProblemDetails: campos ausentes/blancos/nulos, cuerpo nulo o JSON malformado.
 - `Cache-Control: no-store` en respuestas de login, incluidos los errores de entrada y credenciales comprobados.
 
-JWT firmado con HS256, no cifrado: su contenido es legible. Vigencia fija de 60 minutos, tolerancia de reloj de 30 segundos, emisor Refidomsa.Api y audiencia Refidomsa.Client. Incluye `sub` (ID del usuario), `name`, `role`, `distribuidorId` solo para Distribuidor, y `iss`/`aud`/`iat`/`nbf`/`exp`. No contiene password/hash ni credito. Las futuras solicitudes protegidas usaran `Authorization: Bearer <token>`; no hay todavia recursos protegidos.
+JWT firmado con HS256, no cifrado: su contenido es legible. Vigencia fija de 60 minutos, tolerancia de reloj de 30 segundos, emisor Refidomsa.Api y audiencia Refidomsa.Client. Incluye `sub` (ID del usuario), `name`, `role`, `distribuidorId` solo para Distribuidor, y `iss`/`aud`/`iat`/`nbf`/`exp`. No contiene password/hash ni credito. Productos y credito requieren `Authorization: Bearer <token>`.
 
 HTTP loopback y la clave publica son solo para desarrollo. Produccion necesita HTTPS, una clave de firma fuerte y protegida y acceso SQL de minimo privilegio. No hay revocacion anticipada, refresh tokens, registro, recuperacion, logout servidor ni /me.
 
@@ -82,15 +82,29 @@ HTTP loopback y la clave publica son solo para desarrollo. Produccion necesita H
 dotnet build Refidomsa.slnx --configuration Release
 dotnet test Refidomsa.slnx --configuration Release --no-build
 .\scripts\local.ps1 -Accion Verificar
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 1
 ```
 
-Las 144 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT e identidad. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
+Las 159 pruebas no necesitan una base de datos ni un servidor HTTP. Cubren reglas, mapeo/precision EF, DTOs, hashes, emision/validacion criptografica JWT, identidad, saldo negativo y traduccion de errores de negocio. Una prueba comprueba que credito ajeno retorna antes de cualquier consulta. La configuracion de validacion y la comprobacion de claims son compartidas con produccion.
 
 Verificar es un diagnostico de integracion local, separado de las unitarias. Comprueba semilla, hashes, guardado/lectura de un pedido con dos lineas, cantidades decimales, fechas, total, precio historico tras cambiar el catalogo y cambio de estado. Revierte su transaccion y comprueba que no quedan pedido ni precio alterado. No expone un endpoint y solo se admite en Development.
 
-Resultados actuales del 2026-10-06: build Release repetido sin errores/advertencias y 144 pruebas aprobadas, 0 fallos/omisiones. QA SQL/HTTP aprobado: Verificar sin JWT; login 200 de los tres usuarios y nombre con espacios/mayusculas; password con espacios no recortado; 401 genericos iguales; entradas invalidas 400; no-store y health checks anonimos 200. Clave ausente/corta y emisor/audiencia blancos causaron salida no cero sin listener. Datos, hashes, precios e historial EF quedaron sin cambios, con conteos 3/4/3/0. La API de QA se detuvo y SQL quedo saludable; .env y variables de proceso se conservaron. Evidencia: `.sisyphus/evidence/task-4-qa-20261006-182014.txt`.
+Resultados historicos de autenticacion del 2026-10-06: build Release repetido sin errores/advertencias y 144 pruebas aprobadas, 0 fallos/omisiones. QA SQL/HTTP aprobado: Verificar sin JWT; login 200 de los tres usuarios y nombre con espacios/mayusculas; password con espacios no recortado; 401 genericos iguales; entradas invalidas 400; no-store y health checks anonimos 200. Clave ausente/corta y emisor/audiencia blancos causaron salida no cero sin listener. Datos, hashes, precios e historial EF quedaron sin cambios, con conteos 3/4/3/0. La API de QA se detuvo y SQL quedo saludable; .env y variables de proceso se conservaron. Evidencia: `.sisyphus/evidence/task-4-qa-20261006-182014.txt`.
 
-La validacion criptografica se comprobo en unitarias; el QA HTTP decodifico claims, no verifico firmas. No se probo challenge del middleware ni 403/autorizacion por recurso en vivo, pues no existe un recurso protegido. Inicializar tambien se ejecuto sin JWT y termino correctamente en este bloque. Los resultados anteriores de reinicio SQL y readiness 503 son historicos. Las cinco revisiones finales independientes devolvieron PASS (cumplimiento, calidad, seguridad, QA ejecutado y contexto/documentacion); resumen en `.sisyphus/evidence/revision-autenticacion.md`. Esto no certifica produccion ni sustituye el okay y la comprension del candidato. Frontend no implementado ni probado.
+En aquel bloque la validacion criptografica se comprobo en unitarias; el QA HTTP decodifico claims, no verifico firmas. Todavia no habia recursos protegidos para probar challenge/autorizacion en vivo. Inicializar tambien se ejecuto sin JWT. Los resultados de reinicio SQL y readiness 503 son historicos. Las cinco revisiones finales independientes de autenticacion devolvieron PASS; resumen en `.sisyphus/evidence/revision-autenticacion.md`. Esto no certifica produccion ni sustituye el okay y la comprension del candidato. Frontend no implementado ni probado.
+
+## Productos y credito (bloque 1)
+
+El README exige operaciones, no URLs exactas; estos son los contratos minimos adoptados:
+
+- `GET /api/productos`: ambos roles autenticados; array `{id,nombre,precioPorGalon}`, orden SQL nombre/id.
+- `GET /api/distribuidores/{id}/credito`: `{distribuidorId,limiteCredito,creditoConsumido,creditoDisponible}`. Distribuidor solo propio; Operador cualquiera. Ajeno/inexistente devuelve el mismo 404; Guid invalido/vacio 400 ValidationProblemDetails.
+- Credito consumido: suma SQL de Pendiente/Aprobado del propietario, agregado vacio = 0. Disponible utiliza la formula pura `ReglasCredito.CalcularDisponible(limite, consumido)`; no carga pedidos ni lineas y no oculta saldo negativo. Esta lectura informativa NO reserva credito ni protege creaciones concurrentes.
+- JWT ausente, malformado o firma alterada: 401 ProblemDetails y `WWW-Authenticate: Bearer`. Errores de negocio: middleware central con `codigo`, 400 para reglas, 403 sin_permiso, 409 credito_insuficiente/transicion_invalida. Fallos tecnicos siguen hacia UseExceptionHandler con 500 generico; no se convierten en 400. En este bloque no hay una accion HTTP que produzca 403/409: su traduccion esta probada unitariamente.
+
+`qa-pedidos.ps1 -Bloque 1` requiere SQL healthy existente y puertos QA 5081/5082/5173 libres. Crea exclusivamente `Refidomsa_QA_<GuidN>`, inicializa/migra con el comando Development existente y arranca dos APIs Release propias. Password/clave temporales solo en entornos hijos; no usa el password semilla de produccion ni imprime secretos. Finalmente cierra procesos propios, elimina solo su DB y compara digests en memoria de Refidomsa (incluye hashes, catalogo, pedidos, lineas e historial EF) y .env. No modifica Compose, volumen ni variables del padre. Actualmente acepta solo bloque 1; los siguientes bloques ampliaran el harness.
+
+Ejecucion real 2026-10-06: diagnosticos C# sin errores, Release 0 errores/advertencias, 159 unitarias aprobadas sin fallos/omisiones y harness exit0. HTTP: cuatro productos para los tres usuarios, credito propio/operador, consumo mixto exacto 290100 y saldo -90099.75, agregado vacio, 404 ajeno/inexistente, 401 ausente/invalido/firma alterada, 400 IDs invalidos/vacios y segunda API. Limpieza QA y digests originales identicos confirmados.
 
 ## Persistencia y migraciones
 
@@ -120,6 +134,8 @@ No ejecutar `docker compose down -v` salvo que quieras eliminar deliberadamente 
 - Rules: condiciones puras, sin HTTP ni SQL.
 - Data/AppDbContext, Configurations, Migrations y DatosSemilla: persistencia.
 - Controllers/AutenticacionController, DTOs/Autenticacion y Services/AutenticacionService: contrato HTTP y login sobre SQL/hashes existentes.
+- Controllers/ProductosController y DistribuidoresController, DTOs/Productos y Credito, Services/ProductosService y CreditoService: consultas protegidas proyectadas sin tracking.
+- Middlewares/ErroresMiddleware: traduccion exclusiva de excepciones de negocio; UseExceptionHandler conserva los fallos inesperados.
 - Security/ConfiguracionJwt, GeneradorToken y LectorUsuarioActual: configuracion, firma/validacion e identidad autenticada para UsuarioActual.
 - Exceptions: errores de negocio con codigo estable.
 - tests/Refidomsa.UnitTests: pruebas sin DB.
@@ -130,9 +146,9 @@ Precios y galones usan decimal(18,6); importes y credito decimal(28,2). Se recha
 
 ## Pendientes deliberados
 
-1. Autorizacion por recurso al implementar los endpoints de negocio; login/JWT e identidad ya implementados.
+1. Autorizacion por recurso de pedidos; credito propio ya protegido.
 2. DTOs, servicios y controllers de pedidos, filtros y paginacion.
-3. Consultar y reservar credito transaccionalmente, proteger cambios de estado concurrentes y mapear errores a HTTP.
+3. Reservar credito transaccionalmente y proteger cambios de estado concurrentes; consulta de credito y traduccion de reglas a HTTP ya implementadas.
 4. Frontend React y Compose de API/frontend (actualmente solo SQL esta contenerizado).
 5. Suite automatizada de integracion/e2e y CI segun tiempo.
 

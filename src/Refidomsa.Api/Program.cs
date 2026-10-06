@@ -2,7 +2,9 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json.Serialization;
 using Refidomsa.Api.Data;
+using Refidomsa.Api.Middlewares;
 using Refidomsa.Api.Models;
 using Refidomsa.Api.Security;
 using Refidomsa.Api.Services;
@@ -27,7 +29,15 @@ public class Program
         builder.Services.AddScoped<PasswordHasher<Usuario>>();
         builder.Services.AddScoped<DatosSemilla>();
         builder.Services.AddScoped<VerificadorPersistencia>();
-        builder.Services.AddProblemDetails();
+        builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = context =>
+        {
+            context.ProblemDetails.Instance = context.HttpContext.Request.Path;
+            if (context.ProblemDetails.Status == StatusCodes.Status500InternalServerError)
+            {
+                context.ProblemDetails.Title = "Error interno";
+                context.ProblemDetails.Detail = "Ocurrio un error inesperado.";
+            }
+        });
         builder.Services.AddHealthChecks().AddCheck<SqlServerHealthCheck>("sqlserver");
 
         if (!inicializar && !verificar)
@@ -38,6 +48,8 @@ public class Program
             builder.Services.AddSingleton(configuracionJwt);
             builder.Services.AddSingleton<GeneradorToken>();
             builder.Services.AddScoped<AutenticacionService>();
+            builder.Services.AddScoped<ProductosService>();
+            builder.Services.AddScoped<CreditoService>();
             builder.Services.AddHttpContextAccessor();
             builder.Services.AddScoped<LectorUsuarioActual>();
             builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -62,16 +74,21 @@ public class Program
                             context.Response.Headers.WWWAuthenticate = "Bearer";
                             await Results.Problem(statusCode: StatusCodes.Status401Unauthorized,
                                 title: "No autorizado",
-                                detail: "Se requiere una identidad valida.").ExecuteAsync(context.HttpContext);
+                                detail: "Se requiere una identidad valida.",
+                                instance: context.Request.Path).ExecuteAsync(context.HttpContext);
                         },
                         OnForbidden = context => Results.Problem(
                             statusCode: StatusCodes.Status403Forbidden,
                             title: "Acceso denegado",
-                            detail: "No tienes permiso para acceder a este recurso.").ExecuteAsync(context.HttpContext)
+                             detail: "No tienes permiso para acceder a este recurso.",
+                             instance: context.Request.Path,
+                             extensions: new Dictionary<string, object?> { ["codigo"] = "sin_permiso" })
+                             .ExecuteAsync(context.HttpContext)
                     };
                 });
             builder.Services.AddAuthorization();
-            builder.Services.AddControllers();
+            builder.Services.AddControllers().AddJsonOptions(options =>
+                options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter(allowIntegerValues: false)));
         }
 
         var app = builder.Build();
@@ -101,6 +118,7 @@ public class Program
         }
 
         app.UseExceptionHandler();
+        app.UseMiddleware<ErroresMiddleware>();
         app.UseAuthentication();
         app.UseAuthorization();
         app.MapControllers();

@@ -18,6 +18,16 @@ public static class ReglasCredito
             pedido.DistribuidorId == distribuidorId
             && (pedido.Estado == EstadoPedido.Pendiente || pedido.Estado == EstadoPedido.Aprobado));
         decimal creditoConsumido = pedidosQueConsumenCredito.Sum(pedido => pedido.Total);
+        return CalcularDisponible(limite, creditoConsumido);
+    }
+
+    public static decimal CalcularDisponible(decimal limite, decimal creditoConsumido)
+    {
+        if (limite < 0 || creditoConsumido < 0)
+        {
+            throw new ReglaNegocioException("credito_invalido", "El limite y el consumo deben ser validos.");
+        }
+
         return limite - creditoConsumido;
     }
 }
