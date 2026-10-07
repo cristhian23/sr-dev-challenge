@@ -18,5 +18,56 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+  db-init:
+    image: refidomsa-api:local
+    build:
+      context: .
+      dockerfile: src/Refidomsa.Api/Dockerfile
+    command: ["--initialize-db"]
+    restart: "no"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Refidomsa: "Server=sqlserver,1433;Database=Refidomsa;User Id=sa;Password=${SQLSERVER_PASSWORD:?Define SQLSERVER_PASSWORD en .env};Encrypt=True;TrustServerCertificate=True"
+      DatabaseSeed__Password: ${SEED_PASSWORD:?Define SEED_PASSWORD en .env}
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+  api:
+    image: refidomsa-api:local
+    build:
+      context: .
+      dockerfile: src/Refidomsa.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__Refidomsa: "Server=sqlserver,1433;Database=Refidomsa;User Id=sa;Password=${SQLSERVER_PASSWORD:?Define SQLSERVER_PASSWORD en .env};Encrypt=True;TrustServerCertificate=True"
+      DatabaseSeed__Password: ${SEED_PASSWORD:?Define SEED_PASSWORD en .env}
+      Jwt__Clave: ${JWT_KEY:-}
+      Jwt__Emisor: Refidomsa.Api
+      Jwt__Audiencia: Refidomsa.Client
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "4", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
 volumes:
   sqlserver-data:
