@@ -6,13 +6,14 @@ Verificacion final independiente del bloque 2 (2026-10-06): Release 0 advertenci
 
 Backend .NET 10 con modelos encapsulados, reglas puras, EF Core 10.0.12, SQL Server 2022 en Docker, migracion inicial, datos semilla y autenticacion minima con JwtBearer 10.0.12. Hay 242 pruebas unitarias, diagnostico de persistencia y QA aislado SQL/HTTP reproducible para productos, credito, creacion transaccional, consultas y cambios de estado autorizados de pedidos.
 
-Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito, crea y consulta pedidos propios y cancela solo propios Pendiente; el operador consulta credito y pedidos de cualquiera, aprueba/rechaza Pendiente y despacha Aprobado, pero no crea ni cancela. Todavia NO hay frontend. No es una entrega completa del reto.
+Los tres usuarios semilla pueden iniciar sesion y consultar productos. Cada distribuidor consulta solo su credito, crea y consulta pedidos propios y cancela solo propios Pendiente; el operador consulta credito y pedidos de cualquiera, aprueba/rechaza Pendiente y despacha Aprobado, pero no crea ni cancela. El frontend React/Vite/TypeScript implementa login, lista filtrada/paginada, creacion y detalle con acciones por rol/estado.
 
 ## Requisitos locales
 
 - Windows con PowerShell 5.1, SDK .NET 10.0.101 (o parche compatible con global.json).
 - Docker Desktop iniciado en modo de contenedores Linux. SQL Server necesita recursos suficientes (al menos 2 GB de RAM disponibles para el motor).
 - Puerto IPv4 14333 disponible para SQL Server y 5080 para la API.
+- Node.js compatible con Vite 8 (20.19+ o 22.12+; verificado localmente con Node 24) y npm; puerto 5173 para el frontend.
 - Edicion Developer, exclusivamente para desarrollo/pruebas; Compose acepta la EULA del contenedor.
 
 ## Preparar y ejecutar
@@ -96,7 +97,7 @@ Verificar es un diagnostico de integracion local, separado de las unitarias. Com
 
 Resultados historicos de autenticacion del 2026-10-06: build Release repetido sin errores/advertencias y 144 pruebas aprobadas, 0 fallos/omisiones. QA SQL/HTTP aprobado: Verificar sin JWT; login 200 de los tres usuarios y nombre con espacios/mayusculas; password con espacios no recortado; 401 genericos iguales; entradas invalidas 400; no-store y health checks anonimos 200. Clave ausente/corta y emisor/audiencia blancos causaron salida no cero sin listener. Datos, hashes, precios e historial EF quedaron sin cambios, con conteos 3/4/3/0. La API de QA se detuvo y SQL quedo saludable; .env y variables de proceso se conservaron. Evidencia: `.sisyphus/evidence/task-4-qa-20261006-182014.txt`.
 
-En aquel bloque la validacion criptografica se comprobo en unitarias; el QA HTTP decodifico claims, no verifico firmas. Todavia no habia recursos protegidos para probar challenge/autorizacion en vivo. Inicializar tambien se ejecuto sin JWT. Los resultados de reinicio SQL y readiness 503 son historicos. Las cinco revisiones finales independientes de autenticacion devolvieron PASS; resumen en `.sisyphus/evidence/revision-autenticacion.md`. Esto no certifica produccion ni sustituye el okay y la comprension del candidato. Frontend no implementado ni probado.
+En aquel bloque la validacion criptografica se comprobo en unitarias; el QA HTTP decodifico claims, no verifico firmas. Todavia no habia recursos protegidos para probar challenge/autorizacion en vivo. Inicializar tambien se ejecuto sin JWT. Los resultados de reinicio SQL y readiness 503 son historicos. Las cinco revisiones finales independientes de autenticacion devolvieron PASS; resumen en `.sisyphus/evidence/revision-autenticacion.md`. Esto no certifica produccion ni sustituye el okay y la comprension del candidato. El frontend aun no existia en aquel bloque historico.
 
 ## Productos y credito (bloque 1)
 
@@ -145,6 +146,37 @@ El harness ejecuta `scripts/QaConcurrencia.cs` como aplicacion de archivo .NET10
 
 Review-work bloque4: cinco areas finales PASS. Cumplimiento/calidad/seguridad/contexto mediante inspeccion; QA independiente ejecuto Release0warnings/errors,242tests y harness acumulativoexit0. Seguridad encontro propagacion de errores tecnicos SQL sin saneamiento en el harness: catch global ahora informa fallo fijo sin excepcion original ni logs hijos; prueba negativa de puerto ocupado exitnozero y mensaje fijoPASS, re-review seguridadPASS y nueva ejecucion directa completa bloque4exit0. LSP C# individual sin errores; LSP .ps1 no disponible, parser5.1 y ejecucion realPASS. La prueba de dos contextos ejecuta el token EF, y las unitarias traducen su codigo HTTP; el catch de concurrencia del servicio fue verificado por inspeccion, no forzado mediante HTTP.
 
+## Frontend (bloque 5)
+
+Con la API local ejecutandose en 5080, abre otra terminal desde la raiz:
+
+```powershell
+npm --prefix frontend ci
+npm --prefix frontend run dev
+```
+
+Abrir http://127.0.0.1:5173. Vite escucha solo loopback, usa puerto 5173 estricto (falla si esta ocupado) y proxy `/api` -> `http://127.0.0.1:5080`. No se agrego CORS ni contenedor. El build separado se genera en `frontend/dist`; para desplegarlo hace falta servir estos archivos y `/api` bajo el mismo origen. El proxy es del servidor de desarrollo, no del build estatico.
+
+- `src/pages`: login, lista, crear y detalle. Navegacion hash (`#/pedidos`, `#/crear`, `#/pedidos/{id}`) sin libreria de rutas. UI industrial sencilla, labels, foco visible, errores anunciados y tablas con scroll en movil.
+- `src/auth/AuthContext.tsx`: token/usuario solo en memoria, sin localStorage, sessionStorage ni cookies de aplicacion. Recargar requiere login. Logout limpia sesion local, no revoca JWT; password se lee del formulario y se limpia tras cada intento. Un 401 autenticado limpia solo la sesion del token que origino la solicitud, no una sesion posterior.
+- `src/api`: fetch nativo y contratos tipados; muestra ProblemDetails/ValidationProblemDetails y fallo de conexion. 403/404/409 no cierran sesion. No hay Redux, router, bibliotecas de formularios o componentes UI.
+- Lista: diez filas por pagina, estado y dias de creacion dominicanos; Hasta es inclusivo en UI y se envia como inicio del dia siguiente exclusivo. Solo Operador tiene filtro ID distribuidor; no se agrego endpoint de distribuidores. Distribuidor ve credito propio y crear.
+- Crear: 1-4 productos distintos, >=500 por linea, <=9000 total, precision6, entrega >=24 horas/no domingo. `datetime-local` representa hora dominicana y se envia con `-04:00`, independientemente de la zona del navegador. Estimacion con BigInt escalado a seis decimales, redondeo por linea a centavos AwayFromZero para importes positivos, sin libreria decimal. JSON numerico/visualizacion sigue siendo una estimacion; el backend decimal determina precios, totales, permiso y saldo definitivo.
+- Detalle: snapshots guardados, estado/motivo/fechas y acciones permitidas. Envios protegidos por ref y controles deshabilitados. 409 conserva el error y refresca pedido/credito (en crear solo credito). Una creacion completada despues de salir de la pagina no cambia la navegacion de la nueva sesion.
+
+Verificacion reproducible, desde raiz; no correr dos harnesses simultaneamente:
+
+```powershell
+npm --prefix frontend run typecheck
+npm --prefix frontend run build
+npm --prefix frontend exec -- playwright install chromium
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\qa-pedidos.ps1 -Bloque 5 -Frontend
+```
+
+`npm --prefix frontend run test:e2e` es el script de Playwright. El harness invoca su CLI local con credenciales, `QA_DATABASE`, `QA_API_URL` (5081), `QA_BASE_URL` (5173) y token expirado temporales en el entorno hijo; ejecutar la suite mutante por este harness, no contra la DB local normal. Playwright arranca y cierra su Vite propio, no reutiliza listeners. Los tests rechazan entorno sin nombre QA GUID/API aislada. No hay mocks de respuestas: para errores400/403/401 se modifica una solicitud que recibe respuesta real; offline simula fallo de transporte y demoras prueban doble envio. Traces desactivados y salida de QA saneada para secretos conocidos; no es saneamiento universal de diagnosticos. `test-results` es local/ignorado, no compartir artefactos sin revisar.
+
+Evidencia directa: npm ci/typecheck/build exit0; diagnosticos de todos los TS/TSX nuevos sin errores; backend Release0advertencias/errores y242unitarias0fallos/omisiones. Harness bloque5 completo exit0 con3tests Playwright (decimal, recorrido real de los tres usuarios y regresion de solicitudes de sesion anterior),80carreras backend, matriz150 y comprobaciones SQL anteriores. Cleanup de DB/procesos propios y digests Refidomsa/.env identicos. QA independiente repitio la suite final ampliada:3passed16.7s, matriz150/80carreras PASS, digests/cleanup PASS y listeners5081/5082/5173 libres. Review-work cinco areas finalesPASS: cuatro inspecciones y QA ejecutado; no certifica produccion ni aprobacion humana. No se hizo staging/commit/push; docs/.sisyphus/.env se mantienen fuera de futuros commits.
+
 ## Persistencia y migraciones
 
 La base es `Refidomsa`, en `tcp:127.0.0.1,14333`. El volumen `refidomsa_sqlserver-data` conserva los datos. El acceso con sa y TrustServerCertificate se utiliza solo para desarrollo local, no es una configuracion de produccion.
@@ -186,7 +218,7 @@ Precios y galones usan decimal(18,6); importes y credito decimal(28,2). Se recha
 
 ## Pendientes deliberados
 
-1. Frontend React y Compose de API/frontend (actualmente solo SQL esta contenerizado).
-2. Suite de navegador/e2e y CI segun tiempo; SQL/HTTP backend ya dispone de harness aislado acumulativo.
+1. Compose de API/frontend y CI (actualmente solo SQL esta contenerizado).
+2. Despliegue HTTPS con gestion de secretos y permisos SQL de minimo privilegio; pruebas de otros navegadores y una suite UI mas dividida. Playwright actual usa Chromium y dos recorridos de navegador, sin certificar accesibilidad completa ni produccion.
 
 La creacion protege el credito mediante el pedido Pendiente guardado, sin balance mutable ni reserva adicional. No incluimos registro de usuarios, recuperacion de contrasenas ni IA dentro del producto en el alcance inicial.

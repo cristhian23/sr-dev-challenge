@@ -1,6 +1,7 @@
 param(
-    [ValidateSet(1, 2, 3, 4)]
-    [int]$Bloque = 1
+    [ValidateSet(1, 2, 3, 4, 5)]
+    [int]$Bloque = 1,
+    [switch]$Frontend
 )
 
 $ErrorActionPreference = 'Stop'
@@ -706,6 +707,70 @@ function Test-Bloque4 {
     Write-Host 'PASS dos AppDbContext SQL: segundo SaveChanges lanza DbUpdateConcurrencyException y ganador intacto'
 }
 
+function Test-Frontend {
+    Assert-QA $Frontend 'Bloque 5 requiere -Frontend para no omitir navegador.'
+    Reset-Pedidos 2000000
+    Invoke-Sql $qaNombre 'UPDATE Productos SET PrecioPorGalon = 290.1 WHERE Id = @id' @{ '@id' = [Guid]'aaaaaaaa-0000-0000-0000-000000000001' }
+    # Suficientes filas propias para paginar, estados coherentes y credito para crear/cancelar.
+    for ($i = 0; $i -lt 15; $i++) {
+        $estado = 'Cancelado'
+        if ($i -lt 3) { $estado = 'Pendiente' }
+        Invoke-Sql $qaNombre @'
+INSERT INTO Pedidos (Id, DistribuidorId, FechaEntrega, FechaCreacion, FechaCambioEstado, Total, Estado, MotivoRechazo)
+VALUES (@id, @distribuidor, @entrega, @creacion, @creacion, 145050, @estado, NULL);
+INSERT INTO LineasPedido (PedidoId, ProductoId, NombreProducto, Galones, PrecioPorGalon, Subtotal)
+SELECT @id, Id, Nombre, 500, PrecioPorGalon, 145050 FROM Productos WHERE Id = @producto;
+'@ @{ '@id' = [Guid]::NewGuid(); '@distribuidor' = [Guid]$norte; '@estado' = $estado;
+      '@entrega' = [DateTimeOffset]::UtcNow.AddDays(3); '@creacion' = [DateTimeOffset]::UtcNow.AddMinutes(-$i);
+      '@producto' = [Guid]'aaaaaaaa-0000-0000-0000-000000000001' }
+
+    }
+    # Firmado por la clave temporal QA pero expirado: el navegador recibe 401 real.
+    function Convert-Base64Url([byte[]]$bytes) { return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
+    $header = Convert-Base64Url ([Text.Encoding]::UTF8.GetBytes('{"alg":"HS256","typ":"JWT"}'))
+    $payload = @{ sub = '99999999-9999-9999-9999-999999999999'; name = 'QA'; role = 'Operador';
+        iss = 'Refidomsa.QA'; aud = 'Refidomsa.QA.Client';
+        nbf = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeSeconds(); exp = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeSeconds() } | ConvertTo-Json -Compress
+    $body = Convert-Base64Url ([Text.Encoding]::UTF8.GetBytes($payload))
+    $hmac = New-Object Security.Cryptography.HMACSHA256
+    try {
+        $hmac.Key = [Text.Encoding]::UTF8.GetBytes($claveQA)
+        $signature = Convert-Base64Url ($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes("$header.$body")))
+    } finally { $hmac.Dispose() }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = 'node'
+    $info.Arguments = 'node_modules/@playwright/test/cli.js test'
+    $info.WorkingDirectory = Join-Path $raiz 'frontend'
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.EnvironmentVariables['QA_API_URL'] = 'http://127.0.0.1:5081'
+    $info.EnvironmentVariables['QA_BASE_URL'] = 'http://127.0.0.1:5173'
+    $info.EnvironmentVariables['QA_DATABASE'] = $qaNombre
+    $info.EnvironmentVariables['QA_PASSWORD'] = $passwordQA
+    $info.EnvironmentVariables['QA_EXPIRED_TOKEN'] = "$header.$body.$signature"
+    $proceso = New-Object Diagnostics.Process
+    $proceso.StartInfo = $info
+    Assert-QA ($proceso.Start()) 'No se pudo iniciar Playwright.'
+    $entrada = [PSCustomObject]@{ Proceso = $proceso; Salida = $proceso.StandardOutput.ReadToEndAsync(); Error = $proceso.StandardError.ReadToEndAsync() }
+    $procesos.Add($entrada)
+    try {
+        Assert-QA ($proceso.WaitForExit(180000)) 'Timeout navegador QA.'
+        # Fallos de acciones del navegador pueden incluir argumentos: sanear incluso credenciales temporales.
+        $salida = $entrada.Salida.GetAwaiter().GetResult() + $entrada.Error.GetAwaiter().GetResult()
+        foreach ($secreto in @($passwordQA, $claveQA, $conexionQA, "$header.$body.$signature") + @($tokens.Values)) {
+            if ($secreto) { $salida = $salida.Replace([string]$secreto, '[REDACTED]') }
+        }
+        Write-Host $salida
+        Assert-QA ($proceso.ExitCode -eq 0) 'Playwright QA fallo.'
+        $listeners = @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq 5173 })
+        Assert-QA ($listeners.Count -eq 0) 'Listener frontend QA residual; no se detienen procesos ajenos.'
+        Write-Host 'PASS Playwright navegador real contra API/SQL aislados'
+    } finally {
+        if (-not $proceso.HasExited) { & taskkill /PID $proceso.Id /T /F | Out-Null; $proceso.WaitForExit(10000) | Out-Null }
+    }
+}
+
 function Test-Bloque2 {
     Reset-Pedidos 10000000
     $producto = 'aaaaaaaa-0000-0000-0000-000000000001'
@@ -925,6 +990,7 @@ SELECT @pedido, Id, Nombre, 500, PrecioPorGalon, 145050.00 FROM Productos WHERE 
     if ($Bloque -ge 2) { Test-Bloque2 }
     if ($Bloque -ge 3) { Test-Bloque3 }
     if ($Bloque -ge 4) { Test-Bloque4 }
+    if ($Bloque -eq 5) { Test-Frontend }
     Write-Host "PASS bloque $Bloque SQL/HTTP real"
 } catch {
     # No propagar errores tecnicos de conexion/comando ni logs hijos que puedan contener secretos.

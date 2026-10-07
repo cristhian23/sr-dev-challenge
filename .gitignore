@@ -8,3 +8,6 @@ node_modules/
 .vs/
 *.user
 *.suo
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
